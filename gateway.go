@@ -79,7 +79,7 @@ func NewGateway(cfg Config, logger *slog.Logger) (*Gateway, error) {
 	if err != nil {
 		return nil, fmt.Errorf("go node pool: %w", err)
 	}
-	return &Gateway{
+	gateway := &Gateway{
 		cfg:        cfg,
 		logger:     logger,
 		transports: transports,
@@ -87,7 +87,11 @@ func NewGateway(cfg Config, logger *slog.Logger) (*Gateway, error) {
 		goNodes:    goNodes,
 		catalog:    newModelCatalog(cfg.Prefer, cfg.Models.Protocols),
 		stats:      newUsageStats(),
-	}, nil
+	}
+	if cfg.Stats.AuditFile != "" {
+		gateway.stats.SetAudit(newAuditWriter(cfg.Stats.AuditFile))
+	}
+	return gateway, nil
 }
 
 func (g *Gateway) Handler() http.Handler {
@@ -97,6 +101,7 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/responses", g.authenticate(g.handleInference(ProtocolResponses)))
 	mux.HandleFunc("POST /v1/messages", g.authenticate(g.handleInference(ProtocolAnthropic)))
 	mux.HandleFunc("GET /v1/stats", g.authenticate(g.handleStats))
+	mux.HandleFunc("GET /metrics", g.handleMetrics)
 	mux.HandleFunc("GET /healthz", g.handleHealth)
 	return recoveryMiddleware(g.logger, mux)
 }

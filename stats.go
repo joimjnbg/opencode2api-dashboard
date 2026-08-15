@@ -40,6 +40,7 @@ type usageStats struct {
 	models  map[string]*metricRecord
 	hours   map[string]*metricRecord
 	started time.Time
+	audit   *auditWriter
 }
 
 func newUsageStats() *usageStats {
@@ -48,6 +49,14 @@ func newUsageStats() *usageStats {
 		hours:   map[string]*metricRecord{},
 		started: time.Now(),
 	}
+}
+
+// SetAudit configures a JSONL audit file. Returns the previous writer so the
+// caller can decide whether to close it (only once at shutdown).
+func (s *usageStats) SetAudit(a *auditWriter) {
+	s.mu.Lock()
+	s.audit = a
+	s.mu.Unlock()
 }
 
 func (s *usageStats) Record(model string, usage bridgeUsage, cost float64, ok bool) {
@@ -70,6 +79,16 @@ func (s *usageStats) Record(model string, usage bridgeUsage, cost float64, ok bo
 		s.hours[hourKey] = byHour
 	}
 	byHour.add(usage, cost, ok)
+
+	if s.audit != nil {
+		s.audit.write(map[string]any{
+			"ts":    time.Now().UTC().Format(time.RFC3339Nano),
+			"model": model,
+			"ok":    ok,
+			"usage": usage,
+			"cost":  cost,
+		})
+	}
 }
 
 func (s *usageStats) PruneOlderThan(window time.Duration) {

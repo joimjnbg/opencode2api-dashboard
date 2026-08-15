@@ -20,6 +20,7 @@ type Config struct {
 	Models      ModelsConfig      `json:"models"`
 	Performance PerformanceConfig `json:"performance"`
 	Logging     LoggingConfig     `json:"logging"`
+	Stats       StatsConfig       `json:"stats"`
 	Prefer      Tier              `json:"prefer"`
 }
 
@@ -40,6 +41,12 @@ type ModelsConfig struct {
 
 type LoggingConfig struct {
 	Level string `json:"level"`
+}
+
+// StatsConfig controls usage statistics. AuditFile enables durable JSONL
+// audit logging of every request; leave empty to keep stats in memory only.
+type StatsConfig struct {
+	AuditFile string `json:"audit_file"`
 }
 
 type PerformanceConfig struct {
@@ -64,6 +71,7 @@ func LoadConfig(path string) (Config, error) {
 		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
 		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15},
 		Logging:     LoggingConfig{Level: "info"},
+		Stats:       StatsConfig{},
 		Prefer:      TierGo,
 	}
 	dec := json.NewDecoder(strings.NewReader(string(data)))

@@ -27,5 +27,8 @@
   },
   "logging": {
     "level": "info"
+  },
+  "stats": {
+    "audit_file": "opencode2api.audit.jsonl"
   }
 }

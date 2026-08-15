@@ -6,6 +6,7 @@ opencode2api
 opencode2api.exe
 opencode2api.exe~
 *.log
+*.audit.jsonl
 .tmp/
 .gocache/
 node_modules/

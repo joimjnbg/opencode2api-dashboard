@@ -1,6 +1,6 @@
 # opencode2api-dashboard
 
-**opencode2api-dashboard** 是 [opencode2api](https://github.com/jasonxu114514/opencode2api) 的增强分支：在保留原版全部能力（OpenCode Zen / Zen Go 协议代理、多 key 池、多代理调度、协议转换）的基础上，新增 **token/cost 用量统计**与**图形化实时监控仪表盘**。
+**opencode2api-dashboard** 是 [opencode2api](https://github.com/jasonxu114514/opencode2api) 的增强分支：在保留原版全部能力（OpenCode Zen / Zen Go 协议代理、多 key 池、多代理调度、协议转换）的基础上，新增 **token/cost 用量统计**、**JSONL 审计持久化**、**Prometheus 指标**与**图形化实时监控仪表盘**。
 
 `opencode2api` 使用 Go 编写，对外提供标准 OpenAI 与 Anthropic API，并自动添加 OpenCode 客户端请求头，让任何 OpenAI/Anthropic 兼容客户端都能使用 OpenCode Zen 的模型。
 
@@ -29,21 +29,50 @@ Authorization: Bearer <你的本地 server key>
 
 - 非流式响应与 SSE 流式响应都会记录（流式在结束 chunk 解析 usage）。
 - 失败请求也会计数（`failed`），便于观察 key/代理故障。
-- 统计仅存内存，进程重启后归零，适合网关长期运行的场景。
+- 统计仅存内存，进程重启后归零；如需持久化请开启下面的审计日志。
 
-### 2. 图形化仪表盘（Node，零依赖）
+### 2. JSONL 审计日志（持久化）
+
+在 `config.json` 中启用后，每条完成的请求会追加一行 JSON 到文件（默认 `opencode2api.audit.jsonl`），重启不丢失，可被仪表盘/脚本按天聚合：
+
+```json
+{ "cost": 0, "model": "deepseek-v4-flash-free", "ok": true, "ts": "2026-08-15T03:59:02Z", "usage": { "Input": 84, "Output": 8, "Total": 92, "Cached": 0, "Reasoning": 0 } }
+```
+
+```json
+"stats": { "audit_file": "opencode2api.audit.jsonl" }
+```
+
+### 3. Prometheus 指标 `/metrics`
+
+零依赖实现 Prometheus 文本格式，可直接接入 Grafana / VictoriaMetrics / Prometheus：
+
+```
+GET /metrics
+opencode2api_requests_total / requests_success_total / requests_failed_total
+opencode2api_tokens_input_total / output_total / cached_total / reasoning_total
+opencode2api_cost_total        # 均带 model 标签
+opencode2api_proxies_healthy / proxies_total
+opencode2api_keys_zen / keys_go
+opencode2api_up / opencode2api_uptime_seconds
+```
+
+### 4. 图形化仪表盘（Node，零依赖）
 
 `dashboard.mjs` 启动一个本地 HTTP 服务，浏览器打开即可查看：
 
 | 面板 | 内容 |
 | --- | --- |
 | 状态卡片 | 网关状态、模型数、Key 池、代理健康、版本 |
-| 用量卡片 | 总请求/成功率、总成本、Input/Output/Reasoning tokens、运行时长 |
+| 用量卡片 | 总请求/成功率、总成本、Input/Output/Reasoning tokens、成本阈值告警状态 |
 | 请求趋势 | 最近 30 分钟请求量柱状图 |
 | Token 趋势 | 最近 24 小时小时级 token 用量 |
+| 历史趋势 | 审计日志按天聚合的历史用量（重启不丢） |
 | 模型排行 | 按 token 用量排序的模型 TOP 榜 |
 | 失败分布 | HTTP 4xx/5xx 状态统计 |
 | 实时日志 | 网关 debug 日志滚动展示（事件、tier、代理、状态） |
+| 多实例聚合 | 通过 `OPENCODE2API_INSTANCES` 聚合多台网关的用量与健康 |
+| 告警 | 成本阈值 / 失败率阈值 / 实例不可达，触发 webhook（Telegram 等） |
 
 ```bash
 export OPENCODE2API_LOCAL_KEY=sk-your-local-key   # 读取 /v1/stats 的本地密钥
@@ -56,6 +85,43 @@ node dashboard.mjs                                 # 打开 http://127.0.0.1:909
 OPENCODE2API_LOCAL_KEY=sk-your-local-key
 OPENCODE2API_DASHBOARD_PORT=9090
 ```
+
+### 4.1 多实例聚合
+
+多台网关（不同机器/端口）时，聚合所有实例的统计与健康：
+
+```
+OPENCODE2API_INSTANCES='[{"name":"gw1","stats":"http://host1:8080/v1/stats","key":"sk-...","health":"http://host1:8080/healthz"},{"name":"gw2","stats":"http://host2:8080/v1/stats","key":"sk-..."}]'
+```
+
+### 4.2 告警（webhook）
+
+在 `.env` 配置，超过阈值触发 webhook（默认 60 秒内去重）：
+
+```
+OPENCODE2API_ALERT_WEBHOOK=https://api.telegram.org/bot<TOKEN>/sendMessage   # 或任意 webhook
+OPENCODE2API_ALERT_COST_LIMIT=1.5            # 累计成本超 $1.5 告警
+OPENCODE2API_ALERT_FAILURE_RATE=0.3          # 失败率超 30% 告警
+OPENCODE2API_ALERT_INTERVAL=60               # 去重间隔秒
+```
+
+Telegram 用法：URL 追加 `?chat_id=xxx&text={message}`（`{message}` 会被替换）；其他 webhook 直接 POST JSON。
+
+### 5. 终端 CLI `oc-stats.mjs`（零依赖）
+
+不开浏览器也能看用量：
+
+```bash
+export OPENCODE2API_LOCAL_KEY=sk-your-local-key
+node oc-stats.mjs              # 表格
+node oc-stats.mjs --watch      # 每 5 秒刷新
+node oc-stats.mjs --json       # 原始 JSON（供脚本/告警）
+node oc-stats.mjs --top 5      # 只看 token 前 5 的模型
+```
+
+### 6. opencode 客户端插件（可选）
+
+复制 `opencode2api-usage-plugin.mjs` 到 `~/.config/opencode/plugins/`（Windows: `%USERPROFILE%\.config\opencode\plugins\`）。插件为 AI 提供 `query_usage` 工具（会话中可查询网关用量），并在每次会话结束时输出用量摘要。需要环境变量 `OPENCODE2API_LOCAL_KEY`。
 
 ## 原版功能
 
@@ -81,6 +147,7 @@ OPENCODE2API_DASHBOARD_PORT=9090
 | `POST` | `/v1/responses` | OpenAI Responses |
 | `POST` | `/v1/messages` | Anthropic Messages |
 | `GET` | `/v1/stats` | 用量统计（需鉴权） |
+| `GET` | `/metrics` | Prometheus 指标 |
 | `GET` | `/healthz` | 健康检查 |
 
 ## 编译
@@ -89,6 +156,16 @@ OPENCODE2API_DASHBOARD_PORT=9090
 
 ```bash
 go build -o opencode2api ./
+# 带版本号
+go build -ldflags "-X main.version=v1.2.3" -o opencode2api ./
+```
+
+## 一键启动（Windows）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File start.ps1          # 启动网关 + 仪表盘
+powershell -ExecutionPolicy Bypass -File start.ps1 -Stop    # 停止
+powershell -ExecutionPolicy Bypass -File start.ps1 -Restart # 重启
 ```
 
 ## Docker Compose 部署

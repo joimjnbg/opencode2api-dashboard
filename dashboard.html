@@ -24,8 +24,9 @@
   .panel h2 { font-size:14px; margin-bottom:12px; color:var(--dim); font-weight:500; }
   .bars { display:flex; align-items:flex-end; gap:2px; height:120px; }
   .bars div { flex:1; background:var(--blue); border-radius:2px 2px 0 0; min-width:2px; opacity:.85; position:relative; }
-  .bars div:hover::after { content:attr(data-c); position:absolute; bottom:100%; left:50%; transform:translateX(-50%); background:#000; padding:2px 6px; border-radius:4px; font-size:11px; white-space:nowrap; }
+  .bars div:hover::after { content:attr(data-c); position:absolute; bottom:100%; left:50%; transform:translateX(-50%); background:#000; padding:2px 6px; border-radius:4px; font-size:11px; white-space:nowrap; z-index:5; }
   .bars.tokens div { background:var(--purple); }
+  .bars.cost div { background:var(--yellow); }
   .legend { display:flex; gap:16px; margin-top:8px; color:var(--dim); font-size:12px; flex-wrap:wrap; }
   .status-row { display:flex; justify-content:space-between; padding:5px 0; border-bottom:1px dashed var(--border); font-size:13px; }
   .status-row:last-child { border-bottom:none; }
@@ -46,11 +47,12 @@
   .pill.ok { background:rgba(63,185,80,.15); color:var(--green); }
   .pill.err { background:rgba(248,81,73,.15); color:var(--red); }
   .note { color:var(--dim); font-size:12px; margin-top:6px; }
+  .instance-tag { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; margin-right:6px; }
 </style>
 </head>
 <body>
 <h1>opencode2api 网关仪表盘</h1>
-<div class="sub">实时流量 + token/cost 用量 · 每 2 秒自动刷新 · 数据来源 /healthz + /v1/stats + 网关日志</div>
+<div class="sub">实时流量 + token/cost 用量 + 多实例聚合 · 每 2 秒自动刷新 · 数据源 /healthz + /v1/stats + /metrics + 审计日志</div>
 
 <div class="grid" id="healthCards"></div>
 
@@ -70,13 +72,25 @@
 
 <div class="two">
   <div class="panel">
-    <h2>按小时 token 用量（累计）</h2>
+    <h2>按小时 token 用量（聚合）</h2>
     <div class="bars tokens" id="tokenBars"></div>
     <div class="legend"><span>紫色：input+cached tokens</span></div>
   </div>
   <div class="panel">
-    <h2>按模型用量排行（近24h 窗口）</h2>
+    <h2>按模型用量排行</h2>
     <div id="modelRank" style="margin-top:4px;"></div>
+  </div>
+</div>
+
+<div class="two">
+  <div class="panel">
+    <h2>历史用量趋势（审计日志，按天）</h2>
+    <div class="bars tokens" id="auditBars"></div>
+    <div class="legend"><span id="auditNote"></span><span id="auditExt"></span></div>
+  </div>
+  <div class="panel">
+    <h2>监控端点</h2>
+    <div id="metaPanel" class="note" style="line-height:2;"></div>
   </div>
 </div>
 
@@ -100,19 +114,29 @@ function fmtTokens(n){ n = Number(n)||0; if(n>=1e9) return (n/1e9).toFixed(2)+"B
 async function renderHealth(){
   const h = await fetchJSON("/api/health");
   const cards = document.getElementById("healthCards");
-  if (h.error) {
+  const instances = h.instances || [];
+  if (!instances.length) {
     cards.innerHTML = `<div class="card"><div class="label">网关</div><div class="value status-bad">不可达</div></div>`;
     return;
   }
-  const ok = h.ready && h.status === "ok";
-  const keyNote = h.keys ? `${h.keys.zen} zen / ${h.keys.go} go` : "-";
-  cards.innerHTML = `
-    <div class="card"><div class="label">网关状态</div><div class="value ${ok?'status-ok':'status-warn'}">${esc(h.status)}</div></div>
-    <div class="card"><div class="label">模型目录</div><div class="value small">${esc(h.models.total)} 个模型</div></div>
-    <div class="card"><div class="label">暴露模型</div><div class="value small">${esc(h.models.exposed)}</div></div>
-    <div class="card"><div class="label">Key 池</div><div class="value small">${esc(keyNote)}</div></div>
-    <div class="card"><div class="label">代理健康</div><div class="value small">${esc(h.proxies.healthy)}/${esc(h.proxies.total)}</div></div>
-    <div class="card"><div class="label">版本</div><div class="value small">${esc(h.version)}</div></div>`;
+  let instHtml = "";
+  let totalModels = 0, zen = 0, go = 0, healthyProxies = 0, proxyTotal = 0;
+  for (const inst of instances) {
+    const hh = inst.health;
+    const ok = hh && !hh.error && hh.status === "ok";
+    if (hh && !hh.error) {
+      totalModels += hh.models?.total || 0;
+      zen += hh.keys?.zen || 0; go += hh.keys?.go || 0;
+      healthyProxies += hh.proxies?.healthy || 0; proxyTotal += hh.proxies?.total || 0;
+    }
+    instHtml += `<div class="card"><div class="label">实例 ${esc(inst.name)}</div>
+      <div class="value small ${ok?'status-ok':(hh&&hh.error?'status-bad':'status-warn')}">${ok?esc(hh.status):(hh&&hh.error?'不可达':'-')}</div>
+      <div class="note">${ok?('模型 '+esc(hh.models.total)+' · key '+esc((hh.keys?.zen||0))+' zen'):''}</div></div>`;
+  }
+  cards.innerHTML = instHtml + `
+    <div class="card"><div class="label">模型目录总数</div><div class="value small">${totalModels}</div></div>
+    <div class="card"><div class="label">Key 池</div><div class="value small">${zen} zen / ${go} go</div></div>
+    <div class="card"><div class="label">代理健康</div><div class="value small">${healthyProxies}/${proxyTotal}</div></div>`;
 }
 
 function renderUsage(gs){
@@ -122,16 +146,15 @@ function renderUsage(gs){
     cards.innerHTML = `<div class="card"><div class="label">用量统计</div><div class="value status-warn">暂不可用</div></div>`;
     return;
   }
-  const uptime = (gs.uptime_seconds||0);
-  const h = Math.floor(uptime/3600), m = Math.floor((uptime%3600)/60);
   const okRate = total.requests ? Math.round(total.success/total.requests*100) : 0;
+  const nInst = (gs.instances||[]).length;
   cards.innerHTML = `
-    <div class="card"><div class="label">总请求</div><div class="value">${fmtInt(total.requests)}</div><div class="note">成功 ${fmtInt(total.success)} · 失败 ${fmtInt(total.failed)} · 成功率 ${okRate}%</div></div>
+    <div class="card"><div class="label">总请求（${nInst} 实例聚合）</div><div class="value">${fmtInt(total.requests)}</div><div class="note">成功 ${fmtInt(total.success)} · 失败 ${fmtInt(total.failed)} · 成功率 ${okRate}%</div></div>
     <div class="card"><div class="label">总成本</div><div class="value ${Number(total.cost)>0?'status-warn':''}">${fmtCost(total.cost)}</div><div class="note">免费模型为 $0</div></div>
     <div class="card"><div class="label">Input tokens</div><div class="value small">${fmtTokens(total.input_tokens)}</div><div class="note">含 cached ${fmtTokens(total.cached_tokens)}</div></div>
     <div class="card"><div class="label">Output tokens</div><div class="value small">${fmtTokens(total.output_tokens)}</div><div class="note">其中 reasoning ${fmtTokens(total.reasoning_tokens)}</div></div>
     <div class="card"><div class="label">模型数</div><div class="value">${(gs.models||[]).length}</div></div>
-    <div class="card"><div class="label">运行时长</div><div class="value small">${h}h ${m}m</div></div>`;
+    <div class="card"><div class="label">成本阈值告警</div><div class="value small">${COST_LIMIT_CFG>0?'已启用 ≥'+fmtCost(COST_LIMIT_CFG):'未配置'}</div></div>`;
 }
 
 function renderTokenBars(gs){
@@ -170,6 +193,39 @@ function renderModelRank(gs){
   }).join("");
 }
 
+function renderAudit(){
+  fetchJSON("/api/audit").then(a => {
+    const el = document.getElementById("auditBars");
+    const note = document.getElementById("auditNote");
+    const ext = document.getElementById("auditExt");
+    if (!a || !a.by_day || a.by_day.length === 0) {
+      el.innerHTML = `<div class="note">暂无审计历史（配置 stats.audit_file 后按天累积，本视图永不因重启丢失）</div>`;
+      note.textContent = ""; ext.textContent = "";
+      return;
+    }
+    const days = a.by_day.slice(-14);
+    const max = Math.max(1, ...days.map(d=>d.input_tokens));
+    el.innerHTML = days.map(d=>{
+      const v = d.input_tokens||0;
+      const hgt = Math.round((v/max)*100);
+      return `<div data-c="${esc(d.day)}: ${fmtTokens(v)} tok / ${d.requests} req / ${fmtCost(d.cost)}" style="height:${Math.max(hgt,2)}%;opacity:${v?1:.3}" title="${esc(d.day)}"></div>`;
+    }).join("");
+    note.textContent = `最近 ${days.length} 天`;
+    ext.textContent = `审计共 ${fmtInt(a.total_lines)} 条记录`;
+  });
+}
+
+function renderMeta(){
+  const el = document.getElementById("metaPanel");
+  const loc = window.location;
+  const host = loc.hostname;
+  el.innerHTML = `
+    Prometheus: <code>curl http://${esc(host)}:8080/metrics</code><br>
+    用量 API:  <code>curl -H "Authorization: Bearer &lt;key&gt;" http://${esc(host)}:8080/v1/stats</code><br>
+    审计文件:  网关同目录 <code>opencode2api.audit.jsonl</code><br>
+    接入 Grafana: 添加 Prometheus 数据源，指向 <code>http://${esc(host)}:8080/metrics</code>`;
+}
+
 function renderStats(){
   fetchJSON("/api/stats").then(s => {
     const trend = document.getElementById("trend");
@@ -205,6 +261,8 @@ function renderStats(){
   });
 }
 
+const COST_LIMIT_CFG = window.__COST_LIMIT__ || 0;
+
 function refreshGatewayStats(){
   fetchJSON("/api/gateway-stats").then(gs => {
     renderUsage(gs);
@@ -215,10 +273,12 @@ function refreshGatewayStats(){
 
 renderHealth();
 renderStats();
+renderAudit();
+renderMeta();
 refreshGatewayStats();
-setInterval(renderHealth, 2000);
-setInterval(renderStats, 2000);
+setInterval(renderHealth, 5000);
 setInterval(refreshGatewayStats, 5000);
+setInterval(renderStats, 2000);
 </script>
 </body>
 </html>
