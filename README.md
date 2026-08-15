@@ -1,8 +1,63 @@
-# opencode2api
+# opencode2api-dashboard
 
-`opencode2api` 是一个使用 Go 编写的 OpenCode Zen / Zen Go 协议代理。它对外提供标准 OpenAI 与 Anthropic API，并自动添加 OpenCode 客户端请求头。
+**opencode2api-dashboard** 是 [opencode2api](https://github.com/jasonxu114514/opencode2api) 的增强分支：在保留原版全部能力（OpenCode Zen / Zen Go 协议代理、多 key 池、多代理调度、协议转换）的基础上，新增 **token/cost 用量统计**与**图形化实时监控仪表盘**。
 
-主要功能：
+`opencode2api` 使用 Go 编写，对外提供标准 OpenAI 与 Anthropic API，并自动添加 OpenCode 客户端请求头，让任何 OpenAI/Anthropic 兼容客户端都能使用 OpenCode Zen 的模型。
+
+## 本分支新增功能
+
+### 1. 内置用量统计 `/v1/stats`（带鉴权）
+
+网关在内存中按**模型**和**小时**聚合真实用量数据（来自上游响应的 `usage` 与 `cost` 字段）：
+
+```json
+GET /v1/stats
+Authorization: Bearer <你的本地 server key>
+```
+
+```json
+{
+  "uptime_seconds": 3600,
+  "total": { "requests": 20, "success": 20, "failed": 0,
+             "input_tokens": 3022430, "output_tokens": 8639,
+             "cached_tokens": 3009024, "reasoning_tokens": 275,
+             "cost": 0 },
+  "models": [ { "model": "deepseek-v4-flash-free", "stats": { ... } } ],
+  "hours":  [ { "hour": "2026-08-15T03:00:00Z", "stats": { ... } } ]
+}
+```
+
+- 非流式响应与 SSE 流式响应都会记录（流式在结束 chunk 解析 usage）。
+- 失败请求也会计数（`failed`），便于观察 key/代理故障。
+- 统计仅存内存，进程重启后归零，适合网关长期运行的场景。
+
+### 2. 图形化仪表盘（Node，零依赖）
+
+`dashboard.mjs` 启动一个本地 HTTP 服务，浏览器打开即可查看：
+
+| 面板 | 内容 |
+| --- | --- |
+| 状态卡片 | 网关状态、模型数、Key 池、代理健康、版本 |
+| 用量卡片 | 总请求/成功率、总成本、Input/Output/Reasoning tokens、运行时长 |
+| 请求趋势 | 最近 30 分钟请求量柱状图 |
+| Token 趋势 | 最近 24 小时小时级 token 用量 |
+| 模型排行 | 按 token 用量排序的模型 TOP 榜 |
+| 失败分布 | HTTP 4xx/5xx 状态统计 |
+| 实时日志 | 网关 debug 日志滚动展示（事件、tier、代理、状态） |
+
+```bash
+export OPENCODE2API_LOCAL_KEY=sk-your-local-key   # 读取 /v1/stats 的本地密钥
+node dashboard.mjs                                 # 打开 http://127.0.0.1:9090
+```
+
+也支持 `.env` 文件配置：
+
+```
+OPENCODE2API_LOCAL_KEY=sk-your-local-key
+OPENCODE2API_DASHBOARD_PORT=9090
+```
+
+## 原版功能
 
 - 支持 OpenAI Chat Completions、Responses 和 Models API
 - 支持 Anthropic Messages API
@@ -25,11 +80,8 @@
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
 | `POST` | `/v1/responses` | OpenAI Responses |
 | `POST` | `/v1/messages` | Anthropic Messages |
+| `GET` | `/v1/stats` | 用量统计（需鉴权） |
 | `GET` | `/healthz` | 健康检查 |
-
-`/healthz` 无需 API key，返回服务版本以及模型目录、Zen/Go key 和代理池的汇总状态，不会暴露 key 或代理地址。模型目录尚未完成首次刷新、已经过期、没有可暴露模型或没有健康代理时返回 HTTP `503`；其余情况返回 `200`。
-
-模型目录的过期阈值为 `models.refresh_seconds` 的两倍，且不低于 60 秒。刚启动时短暂返回 `503 starting` 属于正常现象，模型列表首次刷新成功后会变为 `200 ok`。
 
 ## 编译
 
@@ -41,41 +93,19 @@ go build -o opencode2api ./
 
 ## Docker Compose 部署
 
-服务器安装 Docker 与 Docker Compose 后，可以在克隆项目后直接启动：
-
 ```bash
-git clone https://github.com/jasonxu114514/opencode2api.git
-cd opencode2api
+git clone <本仓库>
+cd opencode2api-dashboard
 docker compose up -d
-```
 
-
-```bash
 cp config.example.json config.json
 # 编辑 config.json 中的 server_keys、zen_keys 或 go_keys
 docker compose restart
 ```
 
-```bash
-curl http://127.0.0.1:8080/healthz
-docker compose logs -f
-```
-
-如需修改宿主机端口：
-
-```bash
-OPENCODE2API_PORT=18080 docker compose up -d
-```
-
 ## 配置
 
-复制示例配置：
-
-```bash
-cp config.example.json config.json
-```
-
-然后编辑 `config.json`：
+复制示例配置并编辑 `config.json`：
 
 ```json
 {
@@ -89,121 +119,27 @@ cp config.example.json config.json
     "zen": "https://opencode.ai/zen",
     "go": "https://opencode.ai/zen/go"
   },
-  "retry": {
-    "max_attempts": 3,
-    "timeout_seconds": 300
-  },
-  "models": {
-    "refresh_seconds": 300,
-    "protocols": {}
-  },
+  "retry": { "max_attempts": 3, "timeout_seconds": 300 },
+  "models": { "refresh_seconds": 300, "protocols": {} },
   "performance": {
-    "max_idle_conns": 2048,
-    "max_idle_conns_per_host": 256,
-    "max_conns_per_host": 0,
-    "idle_conn_timeout_seconds": 120,
-    "connect_timeout_seconds": 5,
-    "failure_cooldown_seconds": 15
+    "max_idle_conns": 2048, "max_idle_conns_per_host": 256,
+    "max_conns_per_host": 0, "idle_conn_timeout_seconds": 120,
+    "connect_timeout_seconds": 5, "failure_cooldown_seconds": 15
   },
-  "logging": {
-    "level": "info"
-  }
+  "logging": { "level": "info" }
 }
 ```
 
-### 基础字段
+字段含义与原版一致：
 
 | 字段 | 含义 |
 | --- | --- |
-| `listen` | 本地监听地址。默认建议使用 `127.0.0.1:8080`，避免服务直接暴露到公网。 |
-| `server_keys` | 调用本代理时使用的本地 API key 列表。它们只用于本地鉴权，不会发送给 OpenCode。 |
-| `zen_keys` | OpenCode Zen API key 池。允许配置多个 key。 |
-| `go_keys` | OpenCode Zen Go API key 池。没有 Go key 时可以使用空数组。 |
-| `prefer` | 模型同时存在于 Zen 与 Go 时优先使用的上游，值为 `go` 或 `zen`，默认 `go`。仅存在于某一池时不受影响。 |
-| `proxies` | 上游代理列表。支持 `direct`、`http://`、`https://`、`socks5://` 和 `socks5h://`。URL 可以包含代理用户名和密码。 |
-
-`server_keys` 至少需要一个值；`zen_keys` 和 `go_keys` 至少有一个池不能为空。
-
-### key 与代理分配规则
-
-只需要直连时使用：
-
-```json
-"proxies": ["direct"]
-```
-
-SOCKS5 代理示例：
-
-```json
-"proxies": ["socks5://127.0.0.1:1080"]
-```
-
-多个代理示例：
-
-```json
-"proxies": [
-  "http://user:password@127.0.0.1:7890",
-  "socks5://127.0.0.1:1080"
-]
-```
-
-### `upstream`
-
-| 字段 | 含义 |
-| --- | --- |
-| `upstream.zen` | Zen 上游根地址，通常保持为 `https://opencode.ai/zen`。 |
-| `upstream.go` | Zen Go 上游根地址，通常保持为 `https://opencode.ai/zen/go`。 |
-
-### `retry`
-
-| 字段 | 含义 |
-| --- | --- |
-| `retry.max_attempts` | 单个请求的最大尝试次数，包含第一次请求。网络错误、认证失败、限流和 5xx 会切换节点；其他 4xx 属于确定性的请求错误，会直接返回而不轮换 key。 |
-| `retry.timeout_seconds` | 单个客户端请求的总超时时间，同时用于限制上游响应头等待时间。 |
-
-流式响应一旦已经向客户端输出数据，就不会切换节点重新生成，避免拼接两个不同的响应。
-
-### `models`
-
-| 字段 | 含义 |
-| --- | --- |
-| `models.refresh_seconds` | 重新读取 Zen 和 Go 模型列表的间隔秒数。两个列表会并发刷新。 |
-| `models.protocols` | 手动指定模型的原生协议。值只能是 `chat`、`responses` 或 `anthropic`。通常保持为空。 |
-
-
-模型协议覆盖示例：
-
-```json
-"protocols": {
-  "custom-model": "chat"
-}
-```
-
-模型同时存在于 Zen 与 Go 时按 `prefer` 配置选择：值为 `go` 时优先 Go，值为 `zen` 时优先 Zen（默认 `go`）。仅存在于某一池时才使用该池的 key。
-
-### Thinking 工具历史兼容
-
-所有请求都会经过同一个上游请求准备流程，同协议转发和跨协议转换不再使用两套分支。通过 Chat Completions 或 Anthropic Messages API 调用 DeepSeek、Kimi/Moonshot 或 MiMo 模型时，代理会按上游的目标协议规范化 assistant 工具历史：Chat 补全缺失或空的 `reasoning_content`；Anthropic 保留有效 thinking 文本、为缺失或空的 thinking 补充兼容占位内容、将 `redacted_thinking` 转为普通 thinking，并移除这些兼容端点不接受的 `signature`。显式启用 reasoning/thinking 的别名模型也会启用该处理，普通非 reasoning 请求不会被修改。
-
-### `performance`
-
-| 字段 | 含义 |
-| --- | --- |
-| `performance.max_idle_conns` | 所有上游连接池允许保留的最大空闲连接数。 |
-| `performance.max_idle_conns_per_host` | 每个上游主机允许保留的最大空闲连接数。 |
-| `performance.max_conns_per_host` | 每个主机的最大并发连接数。`0` 表示不设置上限。 |
-| `performance.idle_conn_timeout_seconds` | 空闲连接在连接池中保留的时间。 |
-| `performance.connect_timeout_seconds` | 与上游或代理建立 TCP 连接的超时时间。 |
-| `performance.failure_cooldown_seconds` | 连接失败、认证失败、限流或 5xx 后节点的基础冷却时间。连续失败会指数增加冷却时间。 |
-
-### `logging`
-
-| 字段 | 含义 |
-| --- | --- |
-| `logging.level` | 日志级别，支持 `info` 和 `debug`。生产环境建议使用 `info`。 |
-
-日志不会输出完整上游 key、本地 key、Authorization、`x-api-key` 或请求消息正文。
-
+| `listen` | 本地监听地址，建议 `127.0.0.1:8080` 避免暴露公网 |
+| `server_keys` | 调用本代理的本地 API key（只用于本地鉴权） |
+| `zen_keys` | OpenCode Zen API key 池，可多个 |
+| `go_keys` | OpenCode Zen Go API key 池 |
+| `prefer` | 模型同时存在于 Zen 与 Go 时的优先上游（`go`/`zen`） |
+| `proxies` | 上游代理：`direct`、`http://`、`https://`、`socks5://`、`socks5h://` |
 
 ## 会话 ID
 
@@ -211,9 +147,10 @@ SOCKS5 代理示例：
 
 - 每个请求使用不同的 `x-opencode-request`，同一次请求的重试保持不变。
 - 优先使用客户端提供的 `x-opencode-session`、`x-session-id`、`conversation-id`、`conversation_id` 或 `metadata.session_id` 生成会话 ID。
-- 没有显式会话标识时，使用第一条用户消息生成稳定会话 ID，使同一段多轮对话保持一致。
-- 如果两个独立会话的第一条消息完全相同，建议由客户端发送不同的 `x-session-id`，以确保两个会话严格分离。
+- 没有显式会话标识时，使用第一条用户消息生成稳定会话 ID。
 
 ## 致谢
 
 感谢 [LINUX DO](https://linux.do) 社区一直以来的支持。
+
+上游项目：[jasonxu114514/opencode2api](https://github.com/jasonxu114514/opencode2api)。原仓库未附带 LICENSE，本分支按 MIT 协议发布新增代码；使用原版代码时请自行确认合规性。

@@ -30,6 +30,7 @@ type Gateway struct {
 	zenNodes   *nodePool
 	goNodes    *nodePool
 	catalog    *modelCatalog
+	stats      *usageStats
 }
 
 type healthResponse struct {
@@ -85,6 +86,7 @@ func NewGateway(cfg Config, logger *slog.Logger) (*Gateway, error) {
 		zenNodes:   zenNodes,
 		goNodes:    goNodes,
 		catalog:    newModelCatalog(cfg.Prefer, cfg.Models.Protocols),
+		stats:      newUsageStats(),
 	}, nil
 }
 
@@ -94,8 +96,13 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/chat/completions", g.authenticate(g.handleInference(ProtocolChat)))
 	mux.HandleFunc("POST /v1/responses", g.authenticate(g.handleInference(ProtocolResponses)))
 	mux.HandleFunc("POST /v1/messages", g.authenticate(g.handleInference(ProtocolAnthropic)))
+	mux.HandleFunc("GET /v1/stats", g.authenticate(g.handleStats))
 	mux.HandleFunc("GET /healthz", g.handleHealth)
 	return recoveryMiddleware(g.logger, mux)
+}
+
+func (g *Gateway) handleStats(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, g.stats.Snapshot())
 }
 
 func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -260,10 +267,11 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			w.Header().Set("Cache-Control", "no-cache")
 			w.Header().Set("X-Accel-Buffering", "no")
 			w.WriteHeader(resp.StatusCode)
+			usageReader := newUsageExtractReader(resp.Body, route.Protocol, model, g.stats)
 			if external == route.Protocol {
-				_, err = io.Copy(w, resp.Body)
+				_, err = io.Copy(w, usageReader)
 			} else {
-				err = transcodeStream(w, resp.Body, route.Protocol, external, model)
+				err = transcodeStream(w, usageReader, route.Protocol, external, model)
 			}
 			if err != nil && !errors.Is(err, context.Canceled) {
 				g.logger.Debug("stream ended with error", "request_id", ids.Request, "error", err)
@@ -275,6 +283,7 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			writeAPIError(w, external, http.StatusBadGateway, "failed to read upstream response", "upstream_error", ids.Request)
 			return
 		}
+		g.stats.Record(model, usageFromResponse(route.Protocol, responseBody), costFromResponse(responseBody), true)
 		if external != route.Protocol {
 			responseBody, err = convertResponse(route.Protocol, external, responseBody)
 			if err != nil {

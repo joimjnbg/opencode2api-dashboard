@@ -1,8 +1,12 @@
 .key
 config.json
+.env
 opencode/
 opencode2api
 opencode2api.exe
+opencode2api.exe~
 *.log
 .tmp/
 .gocache/
+node_modules/
+dashboard.err.log
