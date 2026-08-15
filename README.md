@@ -1,6 +1,12 @@
 # opencode2api-dashboard
 
+[![CI](https://github.com/joimjnbg/opencode2api-dashboard/actions/workflows/ci.yml/badge.svg)](https://github.com/joimjnbg/opencode2api-dashboard/actions/workflows/ci.yml)
+![版本](https://img.shields.io/badge/version-v2.0.0-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+
 **opencode2api-dashboard** 是 [opencode2api](https://github.com/jasonxu114514/opencode2api) 的增强分支：在保留原版全部能力（OpenCode Zen / Zen Go 协议代理、多 key 池、多代理调度、协议转换）的基础上，新增 **token/cost 用量统计**、**JSONL 审计持久化**、**Prometheus 指标**与**图形化实时监控仪表盘**。
+
+> 更新记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 `opencode2api` 使用 Go 编写，对外提供标准 OpenAI 与 Anthropic API，并自动添加 OpenCode 客户端请求头，让任何 OpenAI/Anthropic 兼容客户端都能使用 OpenCode Zen 的模型。
 
