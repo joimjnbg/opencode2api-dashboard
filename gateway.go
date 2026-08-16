@@ -24,13 +24,14 @@ const (
 )
 
 type Gateway struct {
-	cfg        Config
-	logger     *slog.Logger
-	transports *transportPool
-	zenNodes   *nodePool
-	goNodes    *nodePool
-	catalog    *modelCatalog
-	stats      *usageStats
+	cfg         Config
+	logger      *slog.Logger
+	transports  *transportPool
+	zenNodes    *nodePool
+	goNodes     *nodePool
+	catalog     *modelCatalog
+	stats       *usageStats
+	fingerprint *fingerprintStore
 }
 
 type healthResponse struct {
@@ -87,6 +88,11 @@ func NewGateway(cfg Config, logger *slog.Logger) (*Gateway, error) {
 		goNodes:    goNodes,
 		catalog:    newModelCatalog(cfg.Prefer, cfg.Models.Protocols),
 		stats:      newUsageStats(),
+	}
+	if cfg.Fingerprint.Enabled {
+		gateway.fingerprint = newFingerprintStore(cfg.Fingerprint.PersistFile)
+		zenNodes.SetFingerprints(gateway.fingerprint)
+		goNodes.SetFingerprints(gateway.fingerprint)
 	}
 	if cfg.Stats.AuditFile != "" {
 		gateway.stats.SetAudit(newAuditWriter(cfg.Stats.AuditFile))
@@ -232,10 +238,14 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			writeAPIError(w, external, http.StatusBadRequest, "the model uses an upstream protocol that opencode2api does not expose", "invalid_request_error", "model")
 			return
 		}
-		route, err := g.catalog.Route(model, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0)
+		route, routedModel, err := g.routeWithSanitize(model, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0, g.cfg.Sanitize)
 		if err != nil {
 			writeAPIError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "model")
 			return
+		}
+		if routedModel != "" && routedModel != model {
+			payload["model"] = routedModel
+			model = routedModel
 		}
 		upstreamURL := g.cfg.Upstream.Zen
 		if route.Tier == TierGo {
@@ -257,7 +267,14 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 		defer cancel()
 		resp, err := g.doUpstream(requestCtx, route, encoded, ids)
 		if err != nil {
+			if errors.Is(err, errQuotaExhausted) {
+				g.logger.Warn("all upstream keys in quota cooldown", "request_id", ids.Request, "tier", route.Tier, "model", model)
+				g.stats.Record(model, bridgeUsage{}, 0, false)
+				writeAPIError(w, external, http.StatusServiceUnavailable, "all upstream keys are cooling down due to quota limits; retry later", "rate_limit_exceeded", ids.Request)
+				return
+			}
 			g.logger.Warn("upstream request failed", "request_id", ids.Request, "tier", route.Tier, "error", err)
+			g.stats.Record(model, bridgeUsage{}, 0, false)
 			writeAPIError(w, external, http.StatusBadGateway, "all upstream attempts failed", "upstream_error", ids.Request)
 			return
 		}
@@ -304,36 +321,39 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 }
 
 func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte, ids requestIDs) (*http.Response, error) {
-	var lastResponse *http.Response
-	var lastErr error
 	nodes := g.zenNodes
 	baseURL := g.cfg.Upstream.Zen
 	if route.Tier == TierGo {
 		nodes = g.goNodes
 		baseURL = g.cfg.Upstream.Go
 	}
-	cursor := nodes.CursorFor(ids.Session)
 	if nodes.Len() == 0 {
 		return nil, fmt.Errorf("no %s nodes configured", route.Tier)
 	}
-	for attempt := 1; attempt <= g.cfg.Retry.MaxAttempts; attempt++ {
-		node := cursor.Next()
-		if node == nil {
-			break
-		}
-		if lastResponse != nil {
-			drainAndClose(lastResponse.Body)
-			lastResponse = nil
+
+	// Every active node becomes a silent failover candidate. Quota-exhausted
+	// keys drop out of the rotation immediately (COOLING_DOWN) without ever
+	// reaching the client.
+	active := nodes.ActiveOrder(ids.Session)
+	quotaCooldown := time.Duration(g.cfg.Failover.QuotaCooldownMinutes) * time.Minute
+	if quotaCooldown <= 0 {
+		quotaCooldown = 30 * time.Minute
+	}
+
+	var lastResponse *http.Response
+	var lastErr error
+	anyQuota := false
+
+	for _, node := range active {
+		proxy := nodes.Proxy(node)
+		if proxy == nil {
+			lastErr = errors.New("upstream key has no proxy binding")
+			continue
 		}
 		endpoint := strings.TrimRight(baseURL, "/") + protocolPath(route.Protocol)
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if err != nil {
 			return nil, err
-		}
-		proxy := nodes.Proxy(node)
-		if proxy == nil {
-			lastErr = errors.New("upstream key has no proxy binding")
-			break
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json, text/event-stream")
@@ -342,31 +362,66 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 		req.Header.Set("x-opencode-session", ids.Session)
 		req.Header.Set("x-opencode-request", ids.Request)
 		req.Header.Set("x-opencode-project", ids.Project)
+		if node.machineID != "" {
+			req.Header.Set("x-machine-id", node.machineID)
+			req.Header.Set("vscode-machine-id", node.vscodeMachine)
+		}
 		if route.Protocol == ProtocolAnthropic {
 			req.Header.Set("x-api-key", node.key)
 			req.Header.Set("anthropic-version", "2023-06-01")
 		} else {
 			req.Header.Set("Authorization", "Bearer "+node.key)
 		}
+
 		resp, err := proxy.client.Do(req)
 		status := 0
 		if resp != nil {
 			status = resp.StatusCode
 		}
 		proxyFailed := g.syncProxyResult(ctx, proxy, status, err)
+
 		if err == nil && resp.StatusCode/100 == 2 {
 			nodes.MarkSuccess(node)
-			g.logger.Debug("upstream accepted request", "request_id", ids.Request, "attempt", attempt, "tier", route.Tier, "proxy", redactURL(proxy.name))
+			if g.cfg.RateLimit.Enabled {
+				nodes.ObserveRateLimit(node, resp.Header, g.cfg.RateLimit.Proactive, g.cfg.RateLimit.RotateAtRemaining)
+			}
+			g.logger.Debug("upstream accepted request", "request_id", ids.Request, "tier", route.Tier, "proxy", redactURL(proxy.name))
 			return resp, nil
 		}
-		// Request-shape errors are deterministic and must be returned to the
-		// caller without rotating through unrelated keys. Authentication,
-		// throttling, server, and transport failures remain retryable.
-		if err == nil && resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests {
-			nodes.MarkSuccess(node)
-			g.logger.Debug("upstream rejected request without retry", "request_id", ids.Request, "attempt", attempt, "status", resp.StatusCode, "proxy", redactURL(proxy.name))
-			return resp, nil
+
+// Non-2xx responses must be inspected before deciding to fail over.
+			if err == nil {
+				captured := captureBody(resp, 4<<20)
+				if isQuotaError(captured.status, captured.body, g.cfg.Failover) {
+					nodes.MarkQuotaExceeded(node, quotaCooldown)
+					anyQuota = true
+					g.logger.Warn("upstream quota exceeded, silent failover", "request_id", ids.Request, "tier", route.Tier, "status", captured.status, "proxy", redactURL(proxy.name))
+					continue
+				}
+				// Account-level rejections (bad key, no payment method) are
+				// stable conditions: cool the key for a long period so the
+				// remaining keys carry the traffic, and try the next key
+				// silently. The last rejected response is kept as a fallback
+				// so the client still gets the real error when every key is
+				// rejected.
+				if captured.status == http.StatusUnauthorized || captured.status == http.StatusForbidden {
+					nodes.MarkAccountRejected(node, accountRejectCooldown)
+					lastResponse = resp
+					g.logger.Warn("upstream rejected key, silent failover", "request_id", ids.Request, "tier", route.Tier, "status", captured.status, "proxy", redactURL(proxy.name))
+					continue
+				}
+			// Reconstruct the response body for the caller.
+			resp.Body = io.NopCloser(bytes.NewReader(captured.body))
+			if captured.status >= 400 && captured.status < 500 && captured.status != http.StatusUnauthorized && captured.status != http.StatusForbidden && captured.status != http.StatusTooManyRequests {
+				nodes.MarkSuccess(node)
+				g.logger.Debug("upstream rejected request without retry", "request_id", ids.Request, "status", captured.status, "proxy", redactURL(proxy.name))
+				return resp, nil
+			}
+			lastResponse = resp
+		} else {
+			lastErr = err
 		}
+
 		if proxyFailed {
 			if nodes.Proxy(node) == proxy {
 				nodes.MarkFailure(node, resp, err)
@@ -374,19 +429,33 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 		} else {
 			nodes.MarkFailure(node, resp, err)
 		}
-		lastResponse = resp
-		lastErr = err
 		if err != nil {
-			g.logger.Debug("upstream transport error", "request_id", ids.Request, "attempt", attempt, "proxy", redactURL(proxy.name), "error", err)
+			g.logger.Debug("upstream transport error", "request_id", ids.Request, "tier", route.Tier, "proxy", redactURL(proxy.name), "error", err)
 		} else {
-			g.logger.Debug("upstream rejected request", "request_id", ids.Request, "attempt", attempt, "status", resp.StatusCode, "proxy", redactURL(proxy.name))
+			g.logger.Debug("upstream rejected request", "request_id", ids.Request, "status", resp.StatusCode, "proxy", redactURL(proxy.name), "tier", route.Tier)
 		}
 	}
+
 	if lastResponse != nil {
 		return lastResponse, nil
 	}
-	return nil, lastErr
+	if anyQuota {
+		return nil, errQuotaExhausted
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("all %s nodes cooling down or unavailable", route.Tier)
 }
+
+// errQuotaExhausted signals that every account key in the pool is cooling down
+// after hitting upstream quota limits.
+var errQuotaExhausted = errors.New("all upstream keys exhausted their quota")
+
+// accountRejectCooldown cools keys rejected with 401/403 (invalid key, no
+// payment method). The condition is stable, so a long cooldown keeps the key
+// out of rotation instead of wasting a request on it every retry.
+const accountRejectCooldown = 10 * time.Minute
 
 // syncProxyResult updates proxy health from real traffic. Only timeouts and
 // connection refusals mark a proxy unavailable. Other errors and 4xx/5xx

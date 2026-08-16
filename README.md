@@ -1,7 +1,7 @@
 # opencode2api-dashboard
 
 [![CI](https://github.com/joimjnbg/opencode2api-dashboard/actions/workflows/ci.yml/badge.svg)](https://github.com/joimjnbg/opencode2api-dashboard/actions/workflows/ci.yml)
-![版本](https://img.shields.io/badge/version-v2.0.0-blue)
+![版本](https://img.shields.io/badge/version-v3.0.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 **opencode2api-dashboard** 是 [opencode2api](https://github.com/jasonxu114514/opencode2api) 的增强分支：在保留原版全部能力（OpenCode Zen / Zen Go 协议代理、多 key 池、多代理调度、协议转换）的基础上，新增 **token/cost 用量统计**、**JSONL 审计持久化**、**Prometheus 指标**与**图形化实时监控仪表盘**。
@@ -60,6 +60,7 @@ opencode2api_tokens_input_total / output_total / cached_total / reasoning_total
 opencode2api_cost_total        # 均带 model 标签
 opencode2api_proxies_healthy / proxies_total
 opencode2api_keys_zen / keys_go
+opencode2api_keys_cooling_total # 当前冷却中的 key 数（tier 标签）
 opencode2api_up / opencode2api_uptime_seconds
 ```
 
@@ -79,6 +80,11 @@ opencode2api_up / opencode2api_uptime_seconds
 | 实时日志 | 网关 debug 日志滚动展示（事件、tier、代理、状态） |
 | 多实例聚合 | 通过 `OPENCODE2API_INSTANCES` 聚合多台网关的用量与健康 |
 | 告警 | 成本阈值 / 失败率阈值 / 实例不可达，触发 webhook（Telegram 等） |
+| 模型选择 | 实时拉取网关模型列表，勾选启用 + 设置默认模型，保存写入 opencode 配置 |
+| 配置管理 | 可视化编辑 API Key（掩码显示、自动还原），目标可选网关/全局/用户配置，保存自动备份并重启 |
+| 一键重启 | 设置页重启网关按钮（带确认） |
+| Key 测试 | 粘贴本地 key 验证有效性 |
+| 请求明细 | 最近请求审计明细（时间/模型/结果/token/成本） |
 
 ```bash
 export OPENCODE2API_LOCAL_KEY=sk-your-local-key   # 读取 /v1/stats 的本地密钥
@@ -112,6 +118,41 @@ OPENCODE2API_ALERT_INTERVAL=60               # 去重间隔秒
 ```
 
 Telegram 用法：URL 追加 `?chat_id=xxx&text={message}`（`{message}` 会被替换）；其他 webhook 直接 POST JSON。
+
+### 4.3 模型选择页
+
+仪表盘“模型”标签页：点击“刷新列表”**每次实时**从网关 `/v1/models` 获取模型列表（不缓存），可搜索过滤；勾选要启用的模型、设置默认模型，点“保存模型选择”写入 **opencode 全局配置或用户配置**（下拉选择目标），自动更新 `provider.zen2api.models` 与 `model` 字段，opencode 客户端重启后即可自由选择新模型。
+
+### 4.4 设置页（配置管理 / Key 可视化）
+
+仪表盘“设置”标签页：
+
+- **配置目标**：网关 `config.json` / opencode 全局（`~/.config/opencode/opencode.json`）/ opencode 用户（项目 `opencode.json`），自由切换。
+- **API Key 编辑**：JSON 编辑器，key 以掩码显示（`sk-G****HHR7`），保存时自动还原真实值，浏览器不暴露明文；opencode 用户配置不存在时自动创建。
+- **保存**：写盘前自动备份 `config.json.bak`；保存网关配置后**自动重启网关**生效。
+- **重启网关**：一键重启（带确认，重启期间请求短暂中断）。
+- **Key 测试**：粘贴本地 server key 验证有效性（HTTP 200/401）。
+- **最近请求明细**：审计日志最近 20/50/100 条（时间/模型/结果/token/成本）。
+
+### 4.5 智能代理：静默重试 / 指纹伪装 / 模型清洗（v3）
+
+网关作为“智能代理网关”运行，客户端对多账号限流与切换完全无感：
+
+- **静默 Failover（错误捕获与无感重试）**：上游返回配额错误（`Free usage exceeded`、`rate_limit_exceeded`、402、429 等）时，自动将该 key 冷却（默认 30 分钟，`failover.quota_cooldown_minutes`）并**静默切换下一个健康 key 重试**，客户端不收到任何错误数据；所有 key 均冷却时才返回 503（`"all upstream keys are cooling down..."`），重试请求时节点自动重新参与。
+- **账号级拒绝（401/403）长冷却**：无效 key、未绑定支付方式等稳定拒绝会把该 key 冷却 10 分钟（`accountRejectCooldown`），避免每 15 秒反复打击同一 key；其余 key 继续承担流量，客户端拿到真实错误仅在所有 key 都被拒绝时。
+- **指纹伪装**：`fingerprint.enabled` 开启后，为每个 key 生成**独立且持久**（按 key 哈希存于 `fingerprints.json`，重启不变）的 `x-machine-id` / `vscode-machine-id` 设备指纹，上游按设备维度限流时互不影响。
+- **模型清洗**：`sanitize.model_aliases` 支持模型重映射（如免费→付费模型路由）。⚠️ `strip_free_suffix` 默认 **false**：在 opencode.ai 上 `-free` 后缀就是免费模型的身份标识，剥离后请求会打到付费模型，无支付方式的账号将收到 401 `No payment method`。
+- **主动限速轮换**：`rate_limit.proactive` 开启时，上游 `x-ratelimit-remaining` 低于 `rotate_at_remaining` 会提前把 key 短冷却，优先使用其他 key。
+- **启动自愈**：端口被占（重启竞态）时不再退出，自动退避重试绑定，服务自愈恢复。
+
+新增配置段（`config.json`）：
+
+```json
+"sanitize":    { "enabled": true, "strip_free_suffix": false, "model_aliases": {} },
+"failover":    { "enabled": true, "quota_cooldown_minutes": 30, "treat_generic_429_as_quota": false },
+"fingerprint": { "enabled": true, "persist_file": "fingerprints.json" },
+"rate_limit":  { "enabled": true, "proactive": true, "rotate_at_remaining": 2 }
+```
 
 ### 5. 终端 CLI `oc-stats.mjs`（零依赖）
 

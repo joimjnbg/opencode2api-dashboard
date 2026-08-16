@@ -22,6 +22,10 @@ type Config struct {
 	Logging     LoggingConfig     `json:"logging"`
 	Stats       StatsConfig       `json:"stats"`
 	Prefer      Tier              `json:"prefer"`
+	Sanitize    SanitizeConfig    `json:"sanitize"`
+	Failover    FailoverConfig    `json:"failover"`
+	Fingerprint FingerprintConfig `json:"fingerprint"`
+	RateLimit   RateLimitConfig   `json:"rate_limit"`
 }
 
 type UpstreamConfig struct {
@@ -58,6 +62,38 @@ type PerformanceConfig struct {
 	FailureCooldownSeconds int `json:"failure_cooldown_seconds"`
 }
 
+// SanitizeConfig cleans client request bodies before forwarding upstream.
+// StripFreeSuffix is disabled by default: on opencode.ai the "-free" suffix is
+// the free model's identity, and stripping it routes to the paid model, which
+// accounts without a payment method reject with 401. Use model_aliases for
+// remapping instead.
+type SanitizeConfig struct {
+	Enabled         bool              `json:"enabled"`
+	StripFreeSuffix bool              `json:"strip_free_suffix"`
+	ModelAliases    map[string]string `json:"model_aliases"`
+}
+
+// FailoverConfig controls the silent quota-failover behavior.
+type FailoverConfig struct {
+	Enabled                bool `json:"enabled"`
+	QuotaCooldownMinutes   int  `json:"quota_cooldown_minutes"`
+	TreatGeneric429AsQuota bool `json:"treat_generic_429_as_quota"`
+}
+
+// FingerprintConfig gives every account key a stable fake device identity.
+type FingerprintConfig struct {
+	Enabled     bool   `json:"enabled"`
+	PersistFile string `json:"persist_file"`
+}
+
+// RateLimitConfig lets the scheduler pre-empt rate limiting using upstream
+// x-ratelimit-remaining headers.
+type RateLimitConfig struct {
+	Enabled           bool `json:"enabled"`
+	Proactive         bool `json:"proactive"`
+	RotateAtRemaining int  `json:"rotate_at_remaining"`
+}
+
 func LoadConfig(path string) (Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -73,6 +109,25 @@ func LoadConfig(path string) (Config, error) {
 		Logging:     LoggingConfig{Level: "info"},
 		Stats:       StatsConfig{},
 		Prefer:      TierGo,
+		Sanitize: SanitizeConfig{
+			Enabled:         true,
+			StripFreeSuffix: false,
+			ModelAliases:    map[string]string{},
+		},
+		Failover: FailoverConfig{
+			Enabled:                true,
+			QuotaCooldownMinutes:   30,
+			TreatGeneric429AsQuota: false,
+		},
+		Fingerprint: FingerprintConfig{
+			Enabled:     true,
+			PersistFile: "fingerprints.json",
+		},
+		RateLimit: RateLimitConfig{
+			Enabled:           true,
+			Proactive:         true,
+			RotateAtRemaining: 2,
+		},
 	}
 	dec := json.NewDecoder(strings.NewReader(string(data)))
 	dec.DisallowUnknownFields()

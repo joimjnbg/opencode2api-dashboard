@@ -80,6 +80,12 @@ func (g *Gateway) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	out.WriteString("# TYPE opencode2api_keys_total gauge\n")
 	fmt.Fprintf(&out, "opencode2api_keys_total %d\n", keys)
 
+	zenCooling, goCooling := g.zenNodes.Cooling(), g.goNodes.Cooling()
+	fmt.Fprintf(&out, "# HELP opencode2api_keys_cooling_total Upstream keys currently cooling down\n")
+	out.WriteString("# TYPE opencode2api_keys_cooling_total gauge\n")
+	fmt.Fprintf(&out, "opencode2api_keys_cooling_total{tier=\"zen\"} %d\n", zenCooling)
+	fmt.Fprintf(&out, "opencode2api_keys_cooling_total{tier=\"go\"} %d\n", goCooling)
+
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	_, _ = w.Write([]byte(out.String()))
 }

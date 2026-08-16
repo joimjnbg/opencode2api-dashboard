@@ -165,6 +165,9 @@ type upstreamNode struct {
 	proxyIndex     atomic.Int64
 	failures       atomic.Uint32
 	cooldownUntil  atomic.Int64
+	lastRemaining  atomic.Int64
+	machineID      string
+	vscodeMachine  string
 }
 
 type nodePool struct {
@@ -241,6 +244,127 @@ func (p *nodePool) Proxy(node *upstreamNode) *proxyTransport {
 		return nil
 	}
 	return p.transports.items[index]
+}
+
+// SetFingerprints assigns a stable fake device identity to every node.
+func (p *nodePool) SetFingerprints(store *fingerprintStore) {
+	if p == nil || store == nil {
+		return
+	}
+	for _, node := range p.nodes {
+		node.machineID = store.ForKey(node.key).MachineID
+		node.vscodeMachine = store.ForKey(node.key).VSCodeMachineID
+	}
+}
+
+// MarkQuotaExceeded locks a node in COOLING_DOWN for quota exhaustion. Unlike
+// MarkFailure it is not exponential and never clears early: the account really
+// ran out of free quota, so we must not bounce back until the cooldown elapses.
+func (p *nodePool) MarkQuotaExceeded(node *upstreamNode, cooldown time.Duration) {
+	if node == nil {
+		return
+	}
+	node.failures.Store(0)
+	node.cooldownUntil.Store(time.Now().Add(cooldown).UnixNano())
+}
+
+// MarkAccountRejected cools a node for stable account-level rejections
+// (401/403, e.g. "No payment method"). Unlike transient failures the
+// condition will not clear on its own, so the node stays out of rotation for
+// the full cooldown instead of being hammered every retry window.
+func (p *nodePool) MarkAccountRejected(node *upstreamNode, cooldown time.Duration) {
+	if node == nil {
+		return
+	}
+	node.failures.Store(0)
+	node.cooldownUntil.Store(time.Now().Add(cooldown).UnixNano())
+}
+
+// ObserveRateLimit records the upstream x-ratelimit-remaining header. When
+// proactive limiting is enabled and the remaining budget is about to run out,
+// the node is cooled briefly so the next request is routed elsewhere before
+// the upstream starts returning 429s.
+func (p *nodePool) ObserveRateLimit(node *upstreamNode, header http.Header, proactive bool, rotateAt int) {
+	if node == nil || header == nil {
+		return
+	}
+	raw := header.Get("x-ratelimit-remaining")
+	if raw == "" {
+		raw = header.Get("x-ratelimit-remaining-requests")
+	}
+	remaining := int64(-1)
+	if value, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64); err == nil {
+		remaining = value
+	}
+	node.lastRemaining.Store(remaining)
+	if !proactive || remaining < 0 {
+		return
+	}
+	if remaining <= int64(rotateAt) {
+		// Short idle so Next() prefers another node, but expires quickly.
+		node.cooldownUntil.Store(time.Now().Add(15 * time.Second).UnixNano())
+	}
+}
+
+// Cooling returns how many nodes are currently in COOLING_DOWN (any reason).
+func (p *nodePool) Cooling() int {
+	if p == nil {
+		return 0
+	}
+	now := time.Now().UnixNano()
+	count := 0
+	for _, node := range p.nodes {
+		if node.cooldownUntil.Load() > now {
+			count++
+		}
+	}
+	return count
+}
+
+// ActiveNodeCount returns the number of nodes not currently cooled down.
+func (p *nodePool) ActiveNodeCount() int {
+	if p == nil {
+		return 0
+	}
+	now := time.Now().UnixNano()
+	count := 0
+	for _, node := range p.nodes {
+		if node.cooldownUntil.Load() <= now {
+			count++
+		}
+	}
+	return count
+}
+
+// ActiveOrder returns the nodes that are not currently cooled down, ordered
+// from a stable cursor position for the supplied affinity key. When every node
+// is cooling down the returned slice is empty.
+func (p *nodePool) ActiveOrder(affinity string) []*upstreamNode {
+	if p == nil || len(p.nodes) == 0 {
+		return nil
+	}
+	now := time.Now().UnixNano()
+	start := 0
+	if affinity != "" {
+		hash := fnv.New64a()
+		_, _ = hash.Write([]byte(affinity))
+		start = int(hash.Sum64() % uint64(len(p.nodes)))
+	}
+	out := make([]*upstreamNode, 0, len(p.nodes))
+	for offset := 0; offset < len(p.nodes); offset++ {
+		index := (start + offset) % len(p.nodes)
+		node := p.nodes[index]
+		if node.cooldownUntil.Load() > now {
+			continue
+		}
+		if p.transports != nil {
+			if proxy := p.transports.items[int(node.proxyIndex.Load())]; proxy != nil && !proxy.healthy.Load() {
+				continue
+			}
+		}
+		out = append(out, node)
+	}
+	return out
 }
 
 // RebindProxy moves every key currently using failedProxy to the least-loaded

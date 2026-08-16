@@ -30,5 +30,24 @@
   },
   "stats": {
     "audit_file": "opencode2api.audit.jsonl"
+  },
+  "sanitize": {
+    "enabled": true,
+    "strip_free_suffix": false,
+    "model_aliases": {}
+  },
+  "failover": {
+    "enabled": true,
+    "quota_cooldown_minutes": 30,
+    "treat_generic_429_as_quota": false
+  },
+  "fingerprint": {
+    "enabled": true,
+    "persist_file": "fingerprints.json"
+  },
+  "rate_limit": {
+    "enabled": true,
+    "proactive": true,
+    "rotate_at_remaining": 2
   }
 }

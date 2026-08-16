@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log/slog"
 	"net/http"
@@ -50,9 +51,25 @@ func main() {
 	}
 	go func() {
 		logger.Info("opencode2api listening", "address", cfg.Listen, "version", version)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("server stopped", "error", err)
-			cancel()
+		backoff := time.Second
+		for {
+			err := server.ListenAndServe()
+			if err == nil || errors.Is(err, http.ErrServerClosed) {
+				return
+			}
+			// A restart may race with the previous instance's socket still
+			// being released ("address already in use"). Instead of exiting,
+			// keep retrying so the process survives and binds as soon as the
+			// port is free again.
+			logger.Error("server error, retrying", "error", err, "retry_in", backoff.String())
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			if backoff < 8*time.Second {
+				backoff *= 2
+			}
 		}
 	}()
 

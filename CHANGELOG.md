@@ -6,6 +6,58 @@
 
 - 暂无
 
+## [v3.0.0] - 2026-08-15
+
+### 新增
+
+- **静默 Failover（错误捕获与无感重试）**：网关升级为智能代理——上游返回配额错误（`Free usage exceeded` / `rate_limit_exceeded` / 402 / 429 等）时自动将该 key 冷却（`failover.quota_cooldown_minutes`，默认 30 分钟）并**静默切换下一个健康 key 重试**，客户端全程无感；全部 key 冷却时返回 503 中性提示。
+- **账号级拒绝长冷却**：401/403（无效 key、无支付方式）将 key 冷却 10 分钟，避免反复打击失效 key，其余 key 继续承担流量。
+- **指纹伪装**：`fingerprint.enabled` 为每个 key 生成独立、持久（按 key 哈希存 `fingerprints.json`，重启不变）的 `x-machine-id` / `vscode-machine-id`，规避上游设备维度限流。
+- **模型清洗与重映射**：`sanitize.model_aliases` 支持模型重映射；`sanitize.strip_free_suffix` 默认 **false**（剥离 `-free` 后缀会把免费模型变成付费模型，无支付方式账号将 401）。
+- **主动限速轮换**：`rate_limit.proactive` 按上游 `x-ratelimit-remaining` 提前短冷却 key 轮换。
+- **启动自愈**：绑定端口失败（重启竞态）时自动退避重试，不再进程退出。
+- **新指标** `opencode2api_keys_cooling_total{tier=...}`：当前冷却中的 key 数。
+
+### 变更
+
+- `config.example.json` 与默认配置新增 `sanitize` / `failover` / `fingerprint` / `rate_limit` 四段配置。
+- `healthz` 与 `/metrics` 反映 key 冷却状态。
+- 会话亲和性改为基于 FNV 哈希的稳定轮转（`ActiveOrder`），冷却 key 自动剔除。
+
+### 修复
+
+- **剥离 `-free` 后缀导致上游 401 "No payment method"**（`strip_free_suffix` 误开启）：默认关闭并修正示例配置。
+- **网关进程反复自动终止**（bind 失败即退出）：改为退避重试绑定，重启竞态不再产生空窗期（ECONNREFUSED）。
+- **失效 key 每 15 秒被反复重试**：401/403 改为 10 分钟长冷却。
+
+## [v2.1.0] - 2026-08-15
+
+### 新增
+
+- **模型选择页**：仪表盘新增“模型”标签页，每次点击“刷新列表”实时从网关 `/v1/models` 获取模型列表（不缓存），支持搜索过滤、勾选启用模型、设置默认模型，一键保存写入 opencode 全局或用户配置（自动更新 `provider.zen2api.models` 与 `model` 字段）。
+- **配置管理页（可视化设置 API Key）**：仪表盘新增“设置”标签页，配置目标自由选择——网关 `config.json` / opencode 全局配置（`~/.config/opencode/opencode.json`）/ opencode 用户配置（项目 `opencode.json`）。
+  - API key 以掩码显示（如 `sk-G****HHR7`），保存时自动还原真实值，浏览器不暴露明文。
+  - 保存前自动备份 `config.json.bak`，防止误配损坏配置。
+  - 保存网关配置后自动重启网关使其生效；opencode 配置目标不存在时自动创建。
+- **重启按钮**：设置页一键重启网关进程（带确认，重启期间请求短暂中断）。
+- **本地 Key 测试**：粘贴本地 server key 即可验证有效性（调用 `/v1/models` 检查 HTTP 200/401）。
+- **最近请求明细**：审计日志单条查询 `/api/audit-recent`，设置页展示最近 20/50/100 条请求（时间/模型/结果/token/成本）。
+
+### 新增 API（仪表盘）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/models` | 实时获取网关模型列表（不缓存） |
+| `GET` | `/api/config?target=gateway\|opencode-global\|opencode-user` | 读取配置（key 脱敏） |
+| `POST` | `/api/config?target=...` | 保存配置（自动备份；网关目标自动重启） |
+| `POST` | `/api/restart` | 重启网关进程 |
+| `POST` | `/api/test-key` | 测试本地 key 有效性 |
+| `GET` | `/api/audit-recent?limit=N` | 审计明细（默认 50，最多 500） |
+
+### 变更
+
+- 仪表盘改为三页布局：概览 / 模型 / 设置。
+
 ## [v2.0.0] - 2026-08-15
 
 ### 新增
