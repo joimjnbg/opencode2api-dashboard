@@ -16,6 +16,7 @@ type Config struct {
 	GoKeys      []string          `json:"go_keys"`
 	Proxies     []string          `json:"proxies"`
 	Upstream    UpstreamConfig    `json:"upstream"`
+	UpstreamMode UpstreamMode     `json:"upstream_mode"`
 	Retry       RetryConfig       `json:"retry"`
 	Models      ModelsConfig      `json:"models"`
 	Performance PerformanceConfig `json:"performance"`
@@ -33,6 +34,24 @@ type UpstreamConfig struct {
 	Go  string `json:"go"`
 }
 
+// UpstreamMode selects how the gateway talks to the configured upstream.
+//
+//   - ModeOpenCode (default): the upstream is opencode.ai and the gateway sends
+//     the opencode client headers, treats 401 as "no payment method", and
+//     fetches the model catalog from opencode's /v1/models endpoint.
+//   - ModeOpenAI: the upstream is any OpenAI-compatible endpoint (e.g. Google
+//     AI Studio / Gemini at https://generativelanguage.googleapis.com/v1beta/openai).
+//     The gateway sends only standard headers, allows gemini-* models, and uses
+//     the model list from models.static (or the upstream's /models endpoint).
+type UpstreamMode string
+
+const (
+	ModeOpenCode UpstreamMode = "opencode"
+	ModeOpenAI   UpstreamMode = "openai"
+)
+
+func (m UpstreamMode) isOpenAI() bool { return m == ModeOpenAI }
+
 type RetryConfig struct {
 	MaxAttempts    int `json:"max_attempts"`
 	TimeoutSeconds int `json:"timeout_seconds"`
@@ -41,6 +60,10 @@ type RetryConfig struct {
 type ModelsConfig struct {
 	RefreshSeconds int               `json:"refresh_seconds"`
 	Protocols      map[string]string `json:"protocols"`
+	// Static is a fixed model list used as the catalog instead of fetching it
+	// from the upstream. Required for ModeOpenAI upstreams whose /models
+	// endpoint is not OpenAI-compatible (e.g. Google AI Studio).
+	Static []string `json:"static"`
 }
 
 type LoggingConfig struct {
@@ -128,6 +151,7 @@ func LoadConfig(path string) (Config, error) {
 		Listen:      "127.0.0.1:8080",
 		Proxies:     []string{"direct"},
 		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/zen", Go: "https://opencode.ai/zen/go"},
+		UpstreamMode: ModeOpenCode,
 		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300},
 		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
 		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15},
@@ -171,6 +195,12 @@ func LoadConfig(path string) (Config, error) {
 	trimList(&cfg.Proxies)
 	if cfg.Prefer != TierZen && cfg.Prefer != TierGo {
 		return Config{}, errors.New("prefer must be \"zen\" or \"go\"")
+	}
+	if cfg.UpstreamMode != "" && cfg.UpstreamMode != ModeOpenCode && cfg.UpstreamMode != ModeOpenAI {
+		return Config{}, errors.New("upstream_mode must be \"opencode\" or \"openai\"")
+	}
+	if cfg.UpstreamMode.isOpenAI() && strings.TrimSpace(cfg.Upstream.Zen) == "" {
+		return Config{}, errors.New("upstream.zen must point at the OpenAI-compatible base URL when upstream_mode is \"openai\"")
 	}
 	if cfg.Listen == "" {
 		return Config{}, errors.New("listen must not be empty")

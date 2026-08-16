@@ -5,19 +5,30 @@ import (
 	"io"
 	"net/http"
 	"regexp"
-	"strings"
 )
 
-// quotaErrorPatterns match upstream bodies that signal free-quota exhaustion.
-// The upstream may return them under HTTP 200, 400, 402, 403 or 429 depending
-// on the protocol, so matching must inspect the body, not just the status.
-var quotaErrorPatterns = []*regexp.Regexp{
+// quotaErrorPatternsOpenCode match opencode.ai bodies that signal free-quota
+// exhaustion. The upstream may return them under HTTP 200, 400, 402, 403 or 429
+// depending on the protocol, so matching must inspect the body, not just the
+// status. The bare "429" pattern lets opencode's literal 429 bodies trigger
+// quota cooldown even when TreatGeneric429AsQuota is false.
+var quotaErrorPatternsOpenCode = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)free usage exceeded`),
 	regexp.MustCompile(`(?i)subscribe to go`),
 	regexp.MustCompile(`(?i)rate_limit_exceeded`),
 	regexp.MustCompile(`(?i)quota.*(exceeded|exhausted|reached)`),
 	regexp.MustCompile(`(?i)(no|insufficient|out of).*(quota|balance|credit)`),
 	regexp.MustCompile(`(?i)429`),
+}
+
+// quotaErrorPatternsOpenAI match OpenAI-compatible upstreams (Gemini). A bare
+// "429" is deliberately absent: a generic 429 there is a per-minute rate limit
+// and should throttle only that key (see doUpstream), not cool the whole
+// account. Daily-quota exhaustion still matches via the quota phrases.
+var quotaErrorPatternsOpenAI = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)rate_limit_exceeded`),
+	regexp.MustCompile(`(?i)quota.*(exceeded|exhausted|reached)`),
+	regexp.MustCompile(`(?i)(no|insufficient|out of).*(quota|balance|credit)`),
 }
 
 // retryableStatus marks upstream status codes that are allowed to silently
@@ -35,7 +46,7 @@ func isRetryableStatus(status int) bool {
 
 // isQuotaError reports whether a captured upstream body is a free-quota
 // exhaustion signal that should trigger silent failover to another key.
-func isQuotaError(status int, body []byte, cfg FailoverConfig) bool {
+func isQuotaError(status int, body []byte, cfg FailoverConfig, mode UpstreamMode) bool {
 	if !cfg.Enabled {
 		return false
 	}
@@ -45,8 +56,12 @@ func isQuotaError(status int, body []byte, cfg FailoverConfig) bool {
 	if status == http.StatusTooManyRequests && cfg.TreatGeneric429AsQuota {
 		return true
 	}
+	patterns := quotaErrorPatternsOpenCode
+	if mode.isOpenAI() {
+		patterns = quotaErrorPatternsOpenAI
+	}
 	lower := bytes.ToLower(body)
-	for _, pattern := range quotaErrorPatterns {
+	for _, pattern := range patterns {
 		if pattern.Match(lower) {
 			return true
 		}
@@ -72,24 +87,6 @@ func captureBody(resp *http.Response, limitBytes int64) capturedResponse {
 	return out
 }
 
-// errorBodySanitized rewrites a failed upstream JSON body so that free-quota
-// messages never leak to remotes. When sanitization is enabled the original
-// "message" is replaced with a neutral phrasing.
-func errorBodySanitized(body []byte, cfg FailoverConfig) []byte {
-	if !cfg.Enabled {
-		return body
-	}
-	lower := bytes.ToLower(body)
-	for _, pattern := range quotaErrorPatterns {
-		if pattern.Match(lower) {
-			out := bytes.ReplaceAll(body, []byte(`"message"`), []byte(`"message$x"`))
-			_ = out
-			return []byte(`{"error":{"message":"upstream quota temporarily unavailable","type":"upstream_error","param":null,"code":null}}`)
-		}
-	}
-	return body
-}
-
 // fallbackModel returns the client's original model name when the sanitized
 // name fails to route.
 func (g *Gateway) routeWithSanitize(model string, hasZen, hasGo bool, cfg SanitizeConfig) (modelRoute, string, error) {
@@ -102,5 +99,3 @@ func (g *Gateway) routeWithSanitize(model string, hasZen, hasGo bool, cfg Saniti
 	route, err := g.catalog.Route(model, hasZen, hasGo)
 	return route, model, err
 }
-
-var _ = strings.Contains

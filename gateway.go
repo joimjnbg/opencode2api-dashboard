@@ -90,7 +90,7 @@ func NewGateway(cfg Config, logger *slog.Logger) (*Gateway, error) {
 		transports: transports,
 		zenNodes:   zenNodes,
 		goNodes:    goNodes,
-		catalog:    newModelCatalog(cfg.Prefer, cfg.Models.Protocols),
+		catalog:    newModelCatalog(cfg.Prefer, cfg.Models.Protocols, cfg.UpstreamMode),
 		stats:      newUsageStats(),
 	}
 	zenNodes.SetMultiAccount(cfg.Failover.MultiAccount)
@@ -244,10 +244,14 @@ func (g *Gateway) handleModels(w http.ResponseWriter, _ *http.Request) {
 	models := g.catalog.List()
 	data := make([]map[string]any, 0, len(models))
 	for _, model := range models {
-		if !supportedModel(model) {
+		if !supportedModel(model, g.cfg.UpstreamMode) {
 			continue
 		}
-		data = append(data, map[string]any{"id": model, "object": "model", "created": now, "owned_by": "opencode"})
+		ownedBy := "opencode"
+		if g.cfg.UpstreamMode.isOpenAI() {
+			ownedBy = "google"
+		}
+		data = append(data, map[string]any{"id": model, "object": "model", "created": now, "owned_by": ownedBy})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
@@ -269,7 +273,7 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			writeAPIError(w, external, http.StatusBadRequest, "model is required", "invalid_request_error", "model")
 			return
 		}
-		if !supportedModel(model) {
+		if !supportedModel(model, g.cfg.UpstreamMode) {
 			writeAPIError(w, external, http.StatusBadRequest, "the model uses an upstream protocol that opencode2api does not expose", "invalid_request_error", "model")
 			return
 		}
@@ -448,21 +452,25 @@ requestLoop:
 				lastErr = errors.New("upstream key has no proxy binding")
 				continue
 			}
-			endpoint := strings.TrimRight(baseURL, "/") + protocolPath(route.Protocol)
+			endpoint := strings.TrimRight(baseURL, "/") + protocolPath(route.Protocol, g.cfg.UpstreamMode)
 			req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 			if err != nil {
 				return nil, err
 			}
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("Accept", "application/json, text/event-stream")
-			req.Header.Set("User-Agent", opencodeUserAgent())
-			req.Header.Set("x-opencode-client", "cli")
-			req.Header.Set("x-opencode-session", ids.Session)
-			req.Header.Set("x-opencode-request", ids.Request)
-			req.Header.Set("x-opencode-project", ids.Project)
-			if node.machineID != "" {
-				req.Header.Set("x-machine-id", node.machineID)
-				req.Header.Set("vscode-machine-id", node.vscodeMachine)
+			if g.cfg.UpstreamMode.isOpenAI() {
+				req.Header.Set("User-Agent", "opencode2api/1.0")
+			} else {
+				req.Header.Set("User-Agent", opencodeUserAgent())
+				req.Header.Set("x-opencode-client", "cli")
+				req.Header.Set("x-opencode-session", ids.Session)
+				req.Header.Set("x-opencode-request", ids.Request)
+				req.Header.Set("x-opencode-project", ids.Project)
+				if node.machineID != "" {
+					req.Header.Set("x-machine-id", node.machineID)
+					req.Header.Set("vscode-machine-id", node.vscodeMachine)
+				}
 			}
 			if route.Protocol == ProtocolAnthropic {
 				req.Header.Set("x-api-key", node.key)
@@ -494,7 +502,7 @@ requestLoop:
 				// Restore the body so callers that receive this response
 				// (4xx passthrough, lastResponse fallback) can still read it.
 				resp.Body = io.NopCloser(bytes.NewReader(captured.body))
-				if isQuotaError(captured.status, captured.body, g.cfg.Failover) {
+				if isQuotaError(captured.status, captured.body, g.cfg.Failover, g.cfg.UpstreamMode) {
 					if g.cfg.Failover.MultiAccount && g.cfg.Failover.QuotaParkMinutes > 0 {
 						// Daily free-quota cap: park the account out of rotation
 						// for the quota window instead of the short cooldown, so
@@ -760,7 +768,18 @@ func (g *Gateway) applyProxyHealthResult(result proxyHealthResult, source string
 	g.logger.Debug("proxy health check still failing", "source", source, "upstream_status", upstreamStatus, "proxy", redactURL(result.proxy.name), "error", result.err)
 }
 
-func protocolPath(protocol Protocol) string {
+func protocolPath(protocol Protocol, mode UpstreamMode) string {
+	if mode.isOpenAI() {
+		// OpenAI-compatible upstreams (Gemini) expose chat under /chat/completions
+		// on the configured base URL; /responses and /messages are not supported.
+		if protocol == ProtocolResponses {
+			return "/responses"
+		}
+		if protocol == ProtocolAnthropic {
+			return "/messages"
+		}
+		return "/chat/completions"
+	}
 	switch protocol {
 	case ProtocolResponses:
 		return "/v1/responses"
@@ -773,6 +792,14 @@ func protocolPath(protocol Protocol) string {
 
 func (g *Gateway) StartModelRefresh(ctx context.Context) {
 	refresh := func() {
+		if g.cfg.UpstreamMode.isOpenAI() && len(g.cfg.Models.Static) > 0 {
+			// OpenAI-compatible upstreams (Gemini) may not expose an
+			// OpenAI-shaped /models endpoint, so the catalog is taken from the
+			// configured static list.
+			g.catalog.Replace(g.cfg.Models.Static, nil)
+			g.logger.Info("model catalog loaded from static list", "models", len(g.cfg.Models.Static))
+			return
+		}
 		var zen, goModels []string
 		var wg sync.WaitGroup
 		wg.Add(2)
@@ -812,7 +839,7 @@ func (g *Gateway) refreshTier(ctx context.Context, base string, nodes *nodePool)
 			cancel()
 			return nil
 		}
-		models, status, err := fetchModels(refreshCtx, proxy.client, base, node.key)
+		models, status, err := fetchModels(refreshCtx, proxy.client, base, node.key, g.cfg.UpstreamMode)
 		g.syncProxyResult(refreshCtx, proxy, status, err)
 		cancel()
 		if err == nil {

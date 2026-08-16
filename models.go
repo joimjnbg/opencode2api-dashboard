@@ -45,6 +45,7 @@ type modelCatalog struct {
 	protocols map[string]Protocol
 	updatedAt time.Time
 	prefer    Tier
+	mode      UpstreamMode
 }
 
 type modelCatalogSnapshot struct {
@@ -55,12 +56,12 @@ type modelCatalogSnapshot struct {
 	UpdatedAt time.Time
 }
 
-func newModelCatalog(prefer Tier, overrides map[string]string) *modelCatalog {
+func newModelCatalog(prefer Tier, overrides map[string]string, mode UpstreamMode) *modelCatalog {
 	protocols := make(map[string]Protocol, len(overrides))
 	for model, protocol := range overrides {
 		protocols[model] = Protocol(protocol)
 	}
-	return &modelCatalog{zen: map[string]bool{}, goModels: map[string]bool{}, protocols: protocols, prefer: prefer}
+	return &modelCatalog{zen: map[string]bool{}, goModels: map[string]bool{}, protocols: protocols, prefer: prefer, mode: mode}
 }
 
 func (c *modelCatalog) Replace(zen, goModels []string) {
@@ -138,7 +139,7 @@ func (c *modelCatalog) Snapshot() modelCatalogSnapshot {
 	}
 	exposed := 0
 	for model := range seen {
-		if supportedModel(model) {
+		if supportedModel(model, c.mode) {
 			exposed++
 		}
 	}
@@ -174,8 +175,13 @@ func inferProtocol(model string) Protocol {
 	return ProtocolChat
 }
 
-func supportedModel(model string) bool {
+func supportedModel(model string, mode UpstreamMode) bool {
 	m := strings.ToLower(model)
+	if mode.isOpenAI() {
+		// Generic OpenAI-compatible upstreams (Gemini, etc.) expose models the
+		// opencode blocklist would otherwise reject.
+		return true
+	}
 	return !strings.HasPrefix(m, "gemini-")
 }
 
@@ -185,14 +191,24 @@ type modelsResponse struct {
 	} `json:"data"`
 }
 
-func fetchModels(ctx context.Context, client *http.Client, baseURL, key string) ([]string, int, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/v1/models", nil)
+func fetchModels(ctx context.Context, client *http.Client, baseURL, key string, mode UpstreamMode) ([]string, int, error) {
+	modelsPath := "/v1/models"
+	if mode.isOpenAI() {
+		// OpenAI-compatible upstreams (Gemini) expose models under /models and
+		// return IDs prefixed with "models/".
+		modelsPath = "/models"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+modelsPath, nil)
 	if err != nil {
 		return nil, 0, err
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
-	req.Header.Set("User-Agent", opencodeUserAgent())
-	req.Header.Set("x-opencode-client", "cli")
+	if mode.isOpenAI() {
+		req.Header.Set("User-Agent", "opencode2api/1.0")
+	} else {
+		req.Header.Set("User-Agent", opencodeUserAgent())
+		req.Header.Set("x-opencode-client", "cli")
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, 0, err
@@ -208,9 +224,11 @@ func fetchModels(ctx context.Context, client *http.Client, baseURL, key string) 
 	}
 	models := make([]string, 0, len(payload.Data))
 	for _, item := range payload.Data {
-		if item.ID != "" {
-			models = append(models, item.ID)
+		if item.ID == "" {
+			continue
 		}
+		id := item.ID
+		models = append(models, strings.TrimPrefix(id, "models/"))
 	}
 	if len(models) == 0 {
 		return nil, resp.StatusCode, errors.New("models endpoint returned an empty list")
