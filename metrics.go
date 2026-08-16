@@ -86,6 +86,18 @@ func (g *Gateway) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintf(&out, "opencode2api_keys_cooling_total{tier=\"zen\"} %d\n", zenCooling)
 	fmt.Fprintf(&out, "opencode2api_keys_cooling_total{tier=\"go\"} %d\n", goCooling)
 
+	zenThrottled, goThrottled := 0, 0
+	if !g.zenNodes.ThrottleDeadline().IsZero() {
+		zenThrottled = 1
+	}
+	if !g.goNodes.ThrottleDeadline().IsZero() {
+		goThrottled = 1
+	}
+	fmt.Fprintf(&out, "# HELP opencode2api_account_throttled 1 while the account-level rate-limit window is active\n")
+	out.WriteString("# TYPE opencode2api_account_throttled gauge\n")
+	fmt.Fprintf(&out, "opencode2api_account_throttled{tier=\"zen\"} %d\n", zenThrottled)
+	fmt.Fprintf(&out, "opencode2api_account_throttled{tier=\"go\"} %d\n", goThrottled)
+
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	_, _ = w.Write([]byte(out.String()))
 }

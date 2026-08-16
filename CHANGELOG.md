@@ -6,6 +6,31 @@
 
 - 暂无
 
+## [v3.1.0] - 2026-08-15
+
+### 新增
+
+- **账号级熔断（共享 429 检测）**：实测确认 OpenCode 的限流按账号/工作区共享（一个 key 打爆 429 后同账号其他 key 立即 429，且无 `Retry-After`/剩余额度响应头）。网关现在跟踪每个 key 最近一次 429，短窗口内不同 key 的 429 数达到 `failover.throttle.shared_429_threshold`（默认 2）即判定账号级共享限流，整个 tier 的 key 池进入节流窗口。
+- **背压等待（TCP 拥塞退避）**：节流窗口 60 秒起、每次复发翻倍、上限 600 秒（`initial_seconds`/`max_seconds`）；窗口内请求**等待**（`max_wait_seconds`，默认 60 秒）而不是反复打击 key，到期自动半开探测，成功即解除并清零窗口；等待超时返回 503 + `Retry-After`，客户端可按头重试。
+- **新指标** `opencode2api_account_throttled{tier="zen"|"go"}`：账号级节流是否激活（1/0）。
+- **healthz key 状态**：新增 `zen_status`/`go_status`（working/reject/throttled/cooling）、`throttled`、`throttle_in_seconds` 字段。
+
+### 变更
+
+- `doUpstream` 重构为带背压的请求循环（`requestLoop`）：节流等待 → 候选 key 排序 → 全冷却等待 → 有界 deadline。
+- 新配置段 `failover.throttle`（四个字段，均有合理默认值，可不配）。
+
+### 修复
+
+- **节流窗口过期后死循环**：`ThrottleDeadline` 在窗口已过期时返回零值（视为未节流），避免 `sleepCtx` 负时长立即返回导致的忙循环。
+
+### 新增测试
+
+- `TestShared429BackpressureThrottlesThenRecovers`：共享 429 → 背压等待 → 半开探测成功 → 节流解除（完整链路）。
+- `TestShared429BeyondWaitReturnsThrottleError`：节流窗口超出等待预算 → `throttleError`（503 + Retry-After）。
+- `TestRecord429Threshold`：共享限流检测器阈值逻辑（单元级）。
+- `TestMarkAccountThrottledExponential`：节流窗口指数翻倍与成功解除（单元级）。
+
 ## [v3.0.0] - 2026-08-15
 
 ### 新增

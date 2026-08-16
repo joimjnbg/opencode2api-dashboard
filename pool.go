@@ -177,6 +177,15 @@ type nodePool struct {
 	cooldown     time.Duration
 	bindingsMu   sync.Mutex
 	bindingCount []int
+	// Account-level throttle. Upstreams commonly rate-limit every key of the
+	// same account together, so key rotation alone cannot bypass a 429.
+	// When distinct keys of the pool hit 429 inside the shared window the
+	// whole pool enters a throttle window; requests then wait (backpressure)
+	// instead of failing, and one probe request lifts it (half-open).
+	throttleUntil atomic.Int64 // unixnano, 0 = not throttled
+	throttleHits  atomic.Uint32
+	last429Mu     sync.Mutex
+	last429Seen   []int64 // unixnano per node index
 }
 
 // newNodePool distributes keys over proxies in round-robin order. When there
@@ -278,6 +287,122 @@ func (p *nodePool) MarkAccountRejected(node *upstreamNode, cooldown time.Duratio
 	}
 	node.failures.Store(0)
 	node.cooldownUntil.Store(time.Now().Add(cooldown).UnixNano())
+}
+
+// ThrottleDeadline returns when the account-level throttle window ends
+// (zero time when the pool is not throttled or the window already elapsed).
+func (p *nodePool) ThrottleDeadline() time.Time {
+	if p == nil {
+		return time.Time{}
+	}
+	until := p.throttleUntil.Load()
+	if until == 0 || until <= time.Now().UnixNano() {
+		return time.Time{}
+	}
+	return time.Unix(0, until)
+}
+
+// MarkAccountThrottled enters an exponential throttle window. Repeated 429s
+// double the window (60s, 120s, ...) up to ThrottleConfig.MaxSeconds, mirroring
+// TCP congestion backoff so the upstream rate-limit window can elapse.
+func (p *nodePool) MarkAccountThrottled(cfg ThrottleConfig) {
+	window := time.Duration(cfg.InitialSeconds) * time.Second
+	if window <= 0 {
+		window = 60 * time.Second
+	}
+	hits := p.throttleHits.Add(1)
+	if max := time.Duration(cfg.MaxSeconds) * time.Second; max > 0 {
+		if window*time.Duration(1<<min(hits-1, 8)) > max {
+			window = max
+		} else {
+			window *= time.Duration(1 << min(hits-1, 8))
+		}
+	}
+	p.throttleUntil.Store(time.Now().Add(window).UnixNano())
+}
+
+// ClearAccountThrottle lifts the throttle after a successful probe request.
+func (p *nodePool) ClearAccountThrottle() {
+	p.throttleUntil.Store(0)
+	p.throttleHits.Store(0)
+}
+
+// Record429 notes a 429 on one key. It returns true when at least threshold
+// distinct keys of the pool hit 429 inside the shared window, which means the
+// upstream rate-limits the whole account and key rotation cannot help.
+func (p *nodePool) Record429(node *upstreamNode, window time.Duration, threshold int) bool {
+	if p == nil || node == nil || threshold < 2 || window <= 0 {
+		return false
+	}
+	now := time.Now().UnixNano()
+	p.last429Mu.Lock()
+	defer p.last429Mu.Unlock()
+	if p.last429Seen == nil {
+		p.last429Seen = make([]int64, len(p.nodes))
+	}
+	if node.index >= 0 && node.index < len(p.last429Seen) {
+		p.last429Seen[node.index] = now
+	}
+	distinct := 0
+	for _, seen := range p.last429Seen {
+		if seen >= now-int64(window) {
+			distinct++
+		}
+	}
+	return distinct >= threshold
+}
+
+// keyStatus describes one upstream key for health endpoints. The pool's
+// throttle state is reported on every key when active, since the throttle is
+// account-wide.
+type keyStatus struct {
+	Index         int    `json:"index"`
+	State         string `json:"state"`          // active | cooling | throttled
+	CooldownUntil int64  `json:"cooldown_until"` // unixnano, 0 = none
+}
+
+// StatusSnapshot reports per-key state for healthz/metrics consumers.
+func (p *nodePool) StatusSnapshot() []keyStatus {
+	if p == nil {
+		return nil
+	}
+	now := time.Now().UnixNano()
+	throttled := p.throttleUntil.Load() > now
+	out := make([]keyStatus, 0, len(p.nodes))
+	for _, node := range p.nodes {
+		until := node.cooldownUntil.Load()
+		state := "active"
+		if throttled {
+			state = "throttled"
+		} else if until > now {
+			state = "cooling"
+		}
+		out = append(out, keyStatus{Index: node.index, State: state, CooldownUntil: until})
+	}
+	return out
+}
+
+// EarliestCooldown returns the soonest key cooldown expiry (zero time when no
+// node is cooling down).
+func (p *nodePool) EarliestCooldown() time.Time {
+	if p == nil {
+		return time.Time{}
+	}
+	now := time.Now().UnixNano()
+	var earliest int64
+	for _, node := range p.nodes {
+		until := node.cooldownUntil.Load()
+		if until <= now {
+			continue
+		}
+		if earliest == 0 || until < earliest {
+			earliest = until
+		}
+	}
+	if earliest == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, earliest)
 }
 
 // ObserveRateLimit records the upstream x-ratelimit-remaining header. When

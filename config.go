@@ -74,10 +74,26 @@ type SanitizeConfig struct {
 }
 
 // FailoverConfig controls the silent quota-failover behavior.
+//
+// Failover alone cannot bypass upstream limits that are shared across every
+// key of the same account (429 "rate limit exceeded"). Throttle adds an
+// account-level circuit breaker: when enough distinct keys hit 429 inside the
+// shared window the whole pool enters a throttle window and requests wait
+// (backpressure) instead of failing, probing one request when the window
+// expires (half-open), like TCP congestion control.
 type FailoverConfig struct {
-	Enabled                bool `json:"enabled"`
-	QuotaCooldownMinutes   int  `json:"quota_cooldown_minutes"`
-	TreatGeneric429AsQuota bool `json:"treat_generic_429_as_quota"`
+	Enabled                bool           `json:"enabled"`
+	QuotaCooldownMinutes   int            `json:"quota_cooldown_minutes"`
+	TreatGeneric429AsQuota bool           `json:"treat_generic_429_as_quota"`
+	Throttle               ThrottleConfig `json:"throttle"`
+}
+
+// ThrottleConfig tunes the account-level rate-limit circuit breaker.
+type ThrottleConfig struct {
+	InitialSeconds     int `json:"initial_seconds"`      // first throttle window
+	MaxSeconds         int `json:"max_seconds"`          // window cap after repeated 429s
+	Shared429Threshold int `json:"shared_429_threshold"` // distinct keys 429ing inside the window that prove shared limits
+	MaxWaitSeconds     int `json:"max_wait_seconds"`     // how long a request holds (backpressure) before giving up
 }
 
 // FingerprintConfig gives every account key a stable fake device identity.
@@ -118,6 +134,12 @@ func LoadConfig(path string) (Config, error) {
 			Enabled:                true,
 			QuotaCooldownMinutes:   30,
 			TreatGeneric429AsQuota: false,
+			Throttle: ThrottleConfig{
+				InitialSeconds:     60,
+				MaxSeconds:         600,
+				Shared429Threshold: 2,
+				MaxWaitSeconds:     60,
+			},
 		},
 		Fingerprint: FingerprintConfig{
 			Enabled:     true,

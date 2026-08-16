@@ -39,7 +39,13 @@
   "failover": {
     "enabled": true,
     "quota_cooldown_minutes": 30,
-    "treat_generic_429_as_quota": false
+    "treat_generic_429_as_quota": false,
+    "throttle": {
+      "initial_seconds": 60,
+      "max_seconds": 600,
+      "shared_429_threshold": 2,
+      "max_wait_seconds": 60
+    }
   },
   "fingerprint": {
     "enabled": true,

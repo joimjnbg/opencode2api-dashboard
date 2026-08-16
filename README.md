@@ -1,7 +1,7 @@
 # opencode2api-dashboard
 
 [![CI](https://github.com/joimjnbg/opencode2api-dashboard/actions/workflows/ci.yml/badge.svg)](https://github.com/joimjnbg/opencode2api-dashboard/actions/workflows/ci.yml)
-![版本](https://img.shields.io/badge/version-v3.0.0-blue)
+![版本](https://img.shields.io/badge/version-v3.1.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 **opencode2api-dashboard** 是 [opencode2api](https://github.com/jasonxu114514/opencode2api) 的增强分支：在保留原版全部能力（OpenCode Zen / Zen Go 协议代理、多 key 池、多代理调度、协议转换）的基础上，新增 **token/cost 用量统计**、**JSONL 审计持久化**、**Prometheus 指标**与**图形化实时监控仪表盘**。
@@ -143,16 +143,27 @@ Telegram 用法：URL 追加 `?chat_id=xxx&text={message}`（`{message}` 会被�
 - **指纹伪装**：`fingerprint.enabled` 开启后，为每个 key 生成**独立且持久**（按 key 哈希存于 `fingerprints.json`，重启不变）的 `x-machine-id` / `vscode-machine-id` 设备指纹，上游按设备维度限流时互不影响。
 - **模型清洗**：`sanitize.model_aliases` 支持模型重映射（如免费→付费模型路由）。⚠️ `strip_free_suffix` 默认 **false**：在 opencode.ai 上 `-free` 后缀就是免费模型的身份标识，剥离后请求会打到付费模型，无支付方式的账号将收到 401 `No payment method`。
 - **主动限速轮换**：`rate_limit.proactive` 开启时，上游 `x-ratelimit-remaining` 低于 `rotate_at_remaining` 会提前把 key 短冷却，优先使用其他 key。
+- **账号级熔断（v3.1）**：OpenCode 的限流是**按账号/工作区共享**的——一个 key 被打爆 429 后，同一账号的其他 key 也会立刻 429，key 轮换无法绕过。网关检测到短窗口内**多个不同 key 都返回 429**（`failover.throttle.shared_429_threshold`，默认 2）时判定账号级共享限流：整个 key 池进入**节流窗口**（60s 起、指数退避、上限 600s），窗口内请求**背压等待**（`failover.throttle.max_wait_seconds`，默认 60s）而不是把 key 打到更冷；窗口到期自动半开探测，成功即解除。等待超时返回 503 + `Retry-After`。**⚠️ 要让多 key 轮换真正生效，请配置来自不同 OpenCode 账号的 key**——同账号的 key 共享同一个限流额度。
 - **启动自愈**：端口被占（重启竞态）时不再退出，自动退避重试绑定，服务自愈恢复。
 
 新增配置段（`config.json`）：
 
 ```json
 "sanitize":    { "enabled": true, "strip_free_suffix": false, "model_aliases": {} },
-"failover":    { "enabled": true, "quota_cooldown_minutes": 30, "treat_generic_429_as_quota": false },
+"failover":    { "enabled": true, "quota_cooldown_minutes": 30, "treat_generic_429_as_quota": false,
+                 "throttle": { "initial_seconds": 60, "max_seconds": 600, "shared_429_threshold": 2, "max_wait_seconds": 60 } },
 "fingerprint": { "enabled": true, "persist_file": "fingerprints.json" },
 "rate_limit":  { "enabled": true, "proactive": true, "rotate_at_remaining": 2 }
 ```
+
+`failover.throttle` 字段含义：
+
+| 字段 | 含义 |
+| --- | --- |
+| `initial_seconds` | 账号级节流初始窗口（秒），每次复发翻倍 |
+| `max_seconds` | 节流窗口上限（秒），防止等待过长 |
+| `shared_429_threshold` | 窗口内多少个不同 key 出现 429 即判定账号级共享限流 |
+| `max_wait_seconds` | 请求背压等待上限（秒），超时返回 503 + `Retry-After` |
 
 ### 5. 终端 CLI `oc-stats.mjs`（零依赖）
 

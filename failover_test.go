@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -23,6 +24,10 @@ type fakeUpstream struct {
 	// quotaFirst makes the first observed request return a quota error and
 	// everything afterwards succeed, regardless of which key is selected.
 	quotaFirst atomic.Int32
+	// rateLimitFirst makes the first N observed requests return a generic 429
+	// ("Rate limit exceeded", NOT a quota body) and everything afterwards
+	// succeed. Used to exercise the account-throttle path.
+	rateLimitFirst atomic.Int32
 }
 
 func newFakeUpstream(answers map[string]int) *fakeUpstream {
@@ -46,6 +51,18 @@ func (f *fakeUpstream) handler() http.Handler {
 			w.WriteHeader(429)
 			_, _ = w.Write([]byte(`{"error":{"message":"Free usage exceeded, subscribe to Go","type":"rate_limit_exceeded"}}`))
 			return
+		}
+		for {
+			left := f.rateLimitFirst.Load()
+			if left <= 0 {
+				break
+			}
+			if f.rateLimitFirst.CompareAndSwap(left, left-1) {
+				f.seenKeys.Add(1)
+				w.WriteHeader(429)
+				_, _ = w.Write([]byte(`{"error":{"message":"Rate limit exceeded. Please try again later.","type":"FreeUsageLimitError"}}`))
+				return
+			}
 		}
 		f.seenKeys.Add(1)
 		w.WriteHeader(status)
@@ -82,7 +99,7 @@ func testGateway(t *testing.T, keyAnswers map[string]int, fingerprintEnabled boo
 		Stats:       StatsConfig{},
 		Prefer:      TierGo,
 		Sanitize:    SanitizeConfig{Enabled: true, StripFreeSuffix: true, ModelAliases: map[string]string{}},
-		Failover:    FailoverConfig{Enabled: true, QuotaCooldownMinutes: 30, TreatGeneric429AsQuota: false},
+		Failover:    FailoverConfig{Enabled: true, QuotaCooldownMinutes: 30, TreatGeneric429AsQuota: false, Throttle: ThrottleConfig{InitialSeconds: 1, MaxSeconds: 600, Shared429Threshold: 2, MaxWaitSeconds: 5}},
 		Fingerprint: FingerprintConfig{Enabled: fingerprintEnabled, PersistFile: ""},
 		RateLimit:   RateLimitConfig{Enabled: true, Proactive: true, RotateAtRemaining: 2},
 	}
@@ -202,5 +219,117 @@ func TestQuotaHasNoMachineIDWhenDisabled(t *testing.T) {
 		if id != "" {
 			t.Errorf("fingerprint injected while disabled for %s: %q", key, id)
 		}
+	}
+}
+
+// TestShared429BackpressureThrottlesThenRecovers exercises the account-level
+// circuit breaker: both keys hit a generic 429 (not a quota body), the pool
+// detects the shared limit, holds the request until the throttle window
+// elapses, then a probe succeeds and clears the throttle.
+func TestShared429BackpressureThrottlesThenRecovers(t *testing.T) {
+	// Keys answer 200 by default; the first two observed requests return a
+	// generic 429, then everything succeeds.
+	gw, upstream := testGateway(t, map[string]int{}, true)
+	upstream.rateLimitFirst.Store(2)
+
+	body := []byte(`{"model":"deepseek-v4-flash","messages":[]}`)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	resp, err := gw.doUpstream(ctx, catalogTestRoute(), body, requestIDs{Session: "s", Request: "r", Project: "p"})
+	if err != nil {
+		t.Fatalf("doUpstream: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200 after backpressure recovery, got %d", resp.StatusCode)
+	}
+	if elapsed := time.Since(start); elapsed < 900*time.Millisecond {
+		t.Errorf("request returned too fast (%v): the throttle window was not waited out", elapsed)
+	}
+	// The probe succeeded, so the account throttle must be cleared.
+	if !gw.zenNodes.ThrottleDeadline().IsZero() {
+		t.Error("account throttle still active after a successful probe")
+	}
+	if seen := upstream.seenKeys.Load(); seen != 3 {
+		t.Errorf("expected 3 upstream attempts (2 rejected + 1 probe), got %d", seen)
+	}
+}
+
+// TestShared429BeyondWaitReturnsThrottleError ensures that when the throttle
+// window outlasts the backpressure budget, the gateway gives up with a
+// throttleError (503 + Retry-After) instead of failing keys forever.
+func TestShared429BeyondWaitReturnsThrottleError(t *testing.T) {
+	// Both keys keep returning generic 429s for the whole test: the throttle
+	// window (30s) exceeds the 5s max wait, so the gateway must give up with
+	// a throttleError (503 + Retry-After) instead of looping forever.
+	gw, upstream := testGateway(t, map[string]int{}, true)
+	upstream.rateLimitFirst.Store(1 << 30)
+	body := []byte(`{"model":"deepseek-v4-flash","messages":[]}`)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	gw.cfg.Failover.Throttle.InitialSeconds = 30 // window > max wait budget
+	_, err := gw.doUpstream(ctx, catalogTestRoute(), body, requestIDs{Session: "s", Request: "r", Project: "p"})
+	var te *throttleError
+	if !errors.As(err, &te) {
+		t.Fatalf("expected *throttleError, got %v", err)
+	}
+	if te.retryAfter <= 0 {
+		t.Errorf("throttleError must carry a positive retryAfter, got %v", te.retryAfter)
+	}
+	if gw.zenNodes.ThrottleDeadline().IsZero() {
+		t.Error("account throttle must remain active")
+	}
+}
+
+// TestRecord429Threshold verifies the shared-limit detector directly.
+func TestRecord429Threshold(t *testing.T) {
+	cfg := PerformanceConfig{FailureCooldownSeconds: 1}
+	transports, err := newTransportPool([]string{"direct"}, cfg, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool, err := newNodePool([]string{"key-a", "key-b", "key-c"}, transports, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pool.Record429(pool.nodes[0], time.Minute, 2) {
+		t.Error("one key 429 must not trip the shared-limit detector")
+	}
+	if pool.Record429(pool.nodes[1], time.Minute, 3) {
+		t.Error("two keys but threshold 3 must not trip")
+	}
+	if !pool.Record429(pool.nodes[2], time.Minute, 2) {
+		t.Error("three distinct keys 429 inside the window must trip")
+	}
+}
+
+// TestMarkAccountThrottledExponential verifies the window grows on repeated
+// 429s and resets after a success.
+func TestMarkAccountThrottledExponential(t *testing.T) {
+	cfg := PerformanceConfig{FailureCooldownSeconds: 1}
+	transports, err := newTransportPool([]string{"direct"}, cfg, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool, err := newNodePool([]string{"key-a"}, transports, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.MarkAccountThrottled(ThrottleConfig{InitialSeconds: 1, MaxSeconds: 600, Shared429Threshold: 2, MaxWaitSeconds: 5})
+	first := pool.ThrottleDeadline()
+	if first.IsZero() {
+		t.Fatal("throttle not active after MarkAccountThrottled")
+	}
+	pool.MarkAccountThrottled(ThrottleConfig{InitialSeconds: 1, MaxSeconds: 600, Shared429Threshold: 2, MaxWaitSeconds: 5})
+	second := pool.ThrottleDeadline()
+	if second.Sub(first) < 900*time.Millisecond {
+		t.Errorf("expected the window to double, got %v", second.Sub(first))
+	}
+	pool.ClearAccountThrottle()
+	if !pool.ThrottleDeadline().IsZero() {
+		t.Error("throttle must clear after a successful probe")
 	}
 }

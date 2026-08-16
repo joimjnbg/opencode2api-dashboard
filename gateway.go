@@ -55,9 +55,13 @@ type healthModels struct {
 }
 
 type healthKeys struct {
-	Zen   int `json:"zen"`
-	Go    int `json:"go"`
-	Total int `json:"total"`
+	Zen        int         `json:"zen"`
+	Go         int         `json:"go"`
+	Total      int         `json:"total"`
+	ZenStatus  []keyStatus `json:"zen_status,omitempty"`
+	GoStatus   []keyStatus `json:"go_status,omitempty"`
+	Throttled  string      `json:"throttled,omitempty"`           // "zen" | "go" | "both" | ""
+	ThrottleIn int         `json:"throttle_in_seconds,omitempty"` // seconds until the account throttle window ends
 }
 
 type healthProxies struct {
@@ -155,6 +159,27 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			status = "starting"
 		}
 	}
+	throttled := ""
+	var throttleIn int
+	zenThrottle := g.zenNodes.ThrottleDeadline()
+	goThrottle := g.goNodes.ThrottleDeadline()
+	now := time.Now()
+	switch {
+	case !zenThrottle.IsZero() && !goThrottle.IsZero():
+		throttled = "both"
+	case !zenThrottle.IsZero():
+		throttled = "zen"
+	case !goThrottle.IsZero():
+		throttled = "go"
+	}
+	earliest := zenThrottle
+	if !goThrottle.IsZero() && (earliest.IsZero() || goThrottle.Before(earliest)) {
+		earliest = goThrottle
+	}
+	if !earliest.IsZero() {
+		throttleIn = int(earliest.Sub(now).Seconds())
+	}
+
 	writeJSON(w, httpStatus, healthResponse{
 		Status:  status,
 		Ready:   len(issues) == 0,
@@ -168,7 +193,15 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			LastRefresh:       lastRefresh,
 			StaleAfterSeconds: int(staleAfter / time.Second),
 		},
-		Keys: healthKeys{Zen: zenKeys, Go: goKeys, Total: zenKeys + goKeys},
+		Keys: healthKeys{
+			Zen:        zenKeys,
+			Go:         goKeys,
+			Total:      zenKeys + goKeys,
+			ZenStatus:  g.zenNodes.StatusSnapshot(),
+			GoStatus:   g.goNodes.StatusSnapshot(),
+			Throttled:  throttled,
+			ThrottleIn: throttleIn,
+		},
 		Proxies: healthProxies{
 			Total:     proxyTotal,
 			Healthy:   proxyHealthy,
@@ -267,10 +300,24 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 		defer cancel()
 		resp, err := g.doUpstream(requestCtx, route, encoded, ids)
 		if err != nil {
-			if errors.Is(err, errQuotaExhausted) {
+			var te *throttleError
+			switch {
+			case errors.As(err, &te):
+				g.logger.Warn("account rate limited, returning 503", "request_id", ids.Request, "tier", route.Tier, "retry_after", te.retryAfter)
+				g.stats.Record(model, bridgeUsage{}, 0, false)
+				w.Header().Set("Retry-After", fmt.Sprintf("%d", int(te.retryAfter.Seconds())+1))
+				writeAPIError(w, external, http.StatusServiceUnavailable, "upstream account is rate limited; retry later", "rate_limit_exceeded", ids.Request)
+				return
+			case errors.Is(err, errQuotaExhausted):
 				g.logger.Warn("all upstream keys in quota cooldown", "request_id", ids.Request, "tier", route.Tier, "model", model)
 				g.stats.Record(model, bridgeUsage{}, 0, false)
 				writeAPIError(w, external, http.StatusServiceUnavailable, "all upstream keys are cooling down due to quota limits; retry later", "rate_limit_exceeded", ids.Request)
+				return
+			case errors.Is(err, errAllCooling):
+				g.logger.Warn("all upstream keys cooling down or unavailable", "request_id", ids.Request, "tier", route.Tier, "model", model)
+				g.stats.Record(model, bridgeUsage{}, 0, false)
+				w.Header().Set("Retry-After", "5")
+				writeAPIError(w, external, http.StatusServiceUnavailable, "all upstream keys are temporarily unavailable; retry later", "rate_limit_exceeded", ids.Request)
 				return
 			}
 			g.logger.Warn("upstream request failed", "request_id", ids.Request, "tier", route.Tier, "error", err)
@@ -331,67 +378,114 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 		return nil, fmt.Errorf("no %s nodes configured", route.Tier)
 	}
 
-	// Every active node becomes a silent failover candidate. Quota-exhausted
-	// keys drop out of the rotation immediately (COOLING_DOWN) without ever
-	// reaching the client.
-	active := nodes.ActiveOrder(ids.Session)
 	quotaCooldown := time.Duration(g.cfg.Failover.QuotaCooldownMinutes) * time.Minute
 	if quotaCooldown <= 0 {
 		quotaCooldown = 30 * time.Minute
+	}
+
+	// Backpressure: when the whole account is throttled or every key is
+	// cooling down, hold the request (bounded) instead of failing it right
+	// away. The client hangs for up to MaxWaitSeconds while the rate-limit
+	// window elapses, then one probe request (half-open) decides whether the
+	// pool recovered.
+	maxWait := time.Duration(g.cfg.Failover.Throttle.MaxWaitSeconds) * time.Second
+	if maxWait <= 0 {
+		maxWait = 60 * time.Second
+	}
+	deadline := time.Now().Add(maxWait)
+	sharedWindow := time.Duration(g.cfg.Failover.Throttle.InitialSeconds) * time.Second
+	if sharedWindow <= 0 {
+		sharedWindow = 60 * time.Second
 	}
 
 	var lastResponse *http.Response
 	var lastErr error
 	anyQuota := false
 
-	for _, node := range active {
-		proxy := nodes.Proxy(node)
-		if proxy == nil {
-			lastErr = errors.New("upstream key has no proxy binding")
+requestLoop:
+	for {
+		// Wait out an account-level throttle window before trying any key.
+		if until := nodes.ThrottleDeadline(); !until.IsZero() {
+			if until.After(deadline) {
+				return nil, &throttleError{retryAfter: time.Until(until)}
+			}
+			g.logger.Debug("account rate limit active, holding request", "request_id", ids.Request, "tier", route.Tier, "wait_seconds", int(time.Until(until).Seconds()))
+			if !sleepCtx(ctx, time.Until(until)) {
+				return nil, ctx.Err()
+			}
 			continue
 		}
-		endpoint := strings.TrimRight(baseURL, "/") + protocolPath(route.Protocol)
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "application/json, text/event-stream")
-		req.Header.Set("User-Agent", opencodeUserAgent())
-		req.Header.Set("x-opencode-client", "cli")
-		req.Header.Set("x-opencode-session", ids.Session)
-		req.Header.Set("x-opencode-request", ids.Request)
-		req.Header.Set("x-opencode-project", ids.Project)
-		if node.machineID != "" {
-			req.Header.Set("x-machine-id", node.machineID)
-			req.Header.Set("vscode-machine-id", node.vscodeMachine)
-		}
-		if route.Protocol == ProtocolAnthropic {
-			req.Header.Set("x-api-key", node.key)
-			req.Header.Set("anthropic-version", "2023-06-01")
-		} else {
-			req.Header.Set("Authorization", "Bearer "+node.key)
-		}
 
-		resp, err := proxy.client.Do(req)
-		status := 0
-		if resp != nil {
-			status = resp.StatusCode
-		}
-		proxyFailed := g.syncProxyResult(ctx, proxy, status, err)
-
-		if err == nil && resp.StatusCode/100 == 2 {
-			nodes.MarkSuccess(node)
-			if g.cfg.RateLimit.Enabled {
-				nodes.ObserveRateLimit(node, resp.Header, g.cfg.RateLimit.Proactive, g.cfg.RateLimit.RotateAtRemaining)
+		active := nodes.ActiveOrder(ids.Session)
+		if len(active) == 0 {
+			if earliest := nodes.EarliestCooldown(); !earliest.IsZero() && !earliest.After(deadline) {
+				g.logger.Debug("all keys cooling down, holding request", "request_id", ids.Request, "tier", route.Tier, "wait_seconds", int(time.Until(earliest).Seconds()))
+				if !sleepCtx(ctx, time.Until(earliest)) {
+					return nil, ctx.Err()
+				}
+				continue
 			}
-			g.logger.Debug("upstream accepted request", "request_id", ids.Request, "tier", route.Tier, "proxy", redactURL(proxy.name))
-			return resp, nil
+			if anyQuota {
+				return nil, errQuotaExhausted
+			}
+			return nil, errAllCooling
 		}
 
-// Non-2xx responses must be inspected before deciding to fail over.
+		// Every active node becomes a silent failover candidate. Quota-exhausted
+		// keys drop out of the rotation immediately (COOLING_DOWN) without ever
+		// reaching the client.
+		for _, node := range active {
+			proxy := nodes.Proxy(node)
+			if proxy == nil {
+				lastErr = errors.New("upstream key has no proxy binding")
+				continue
+			}
+			endpoint := strings.TrimRight(baseURL, "/") + protocolPath(route.Protocol)
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+			if err != nil {
+				return nil, err
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Accept", "application/json, text/event-stream")
+			req.Header.Set("User-Agent", opencodeUserAgent())
+			req.Header.Set("x-opencode-client", "cli")
+			req.Header.Set("x-opencode-session", ids.Session)
+			req.Header.Set("x-opencode-request", ids.Request)
+			req.Header.Set("x-opencode-project", ids.Project)
+			if node.machineID != "" {
+				req.Header.Set("x-machine-id", node.machineID)
+				req.Header.Set("vscode-machine-id", node.vscodeMachine)
+			}
+			if route.Protocol == ProtocolAnthropic {
+				req.Header.Set("x-api-key", node.key)
+				req.Header.Set("anthropic-version", "2023-06-01")
+			} else {
+				req.Header.Set("Authorization", "Bearer "+node.key)
+			}
+
+			resp, err := proxy.client.Do(req)
+			status := 0
+			if resp != nil {
+				status = resp.StatusCode
+			}
+			proxyFailed := g.syncProxyResult(ctx, proxy, status, err)
+
+			if err == nil && resp.StatusCode/100 == 2 {
+				nodes.MarkSuccess(node)
+				nodes.ClearAccountThrottle()
+				if g.cfg.RateLimit.Enabled {
+					nodes.ObserveRateLimit(node, resp.Header, g.cfg.RateLimit.Proactive, g.cfg.RateLimit.RotateAtRemaining)
+				}
+				g.logger.Debug("upstream accepted request", "request_id", ids.Request, "tier", route.Tier, "proxy", redactURL(proxy.name))
+				return resp, nil
+			}
+
+			// Non-2xx responses must be inspected before deciding to fail over.
 			if err == nil {
 				captured := captureBody(resp, 4<<20)
+				// Restore the body so callers that receive this response
+				// (4xx passthrough, lastResponse fallback) can still read it.
+				resp.Body = io.NopCloser(bytes.NewReader(captured.body))
 				if isQuotaError(captured.status, captured.body, g.cfg.Failover) {
 					nodes.MarkQuotaExceeded(node, quotaCooldown)
 					anyQuota = true
@@ -410,30 +504,45 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 					g.logger.Warn("upstream rejected key, silent failover", "request_id", ids.Request, "tier", route.Tier, "status", captured.status, "proxy", redactURL(proxy.name))
 					continue
 				}
-			// Reconstruct the response body for the caller.
-			resp.Body = io.NopCloser(bytes.NewReader(captured.body))
-			if captured.status >= 400 && captured.status < 500 && captured.status != http.StatusUnauthorized && captured.status != http.StatusForbidden && captured.status != http.StatusTooManyRequests {
-				nodes.MarkSuccess(node)
-				g.logger.Debug("upstream rejected request without retry", "request_id", ids.Request, "status", captured.status, "proxy", redactURL(proxy.name))
-				return resp, nil
+				// A 429 cools this key, but when distinct keys of the same
+				// pool hit 429 inside the shared window the upstream is rate
+				// limiting the whole account: key rotation cannot help, so
+				// the pool enters a throttle window and the request is held
+				// (backpressure) until it elapses.
+				if captured.status == http.StatusTooManyRequests {
+					nodes.MarkFailure(node, resp, err)
+					if nodes.Record429(node, sharedWindow, g.cfg.Failover.Throttle.Shared429Threshold) {
+						nodes.MarkAccountThrottled(g.cfg.Failover.Throttle)
+						g.logger.Warn("shared account rate limit detected, throttling tier", "request_id", ids.Request, "tier", route.Tier, "proxy", redactURL(proxy.name))
+						continue requestLoop
+					}
+					lastResponse = resp
+					continue
+				}
+				if captured.status >= 400 && captured.status < 500 {
+					nodes.MarkSuccess(node)
+					g.logger.Debug("upstream rejected request without retry", "request_id", ids.Request, "status", captured.status, "proxy", redactURL(proxy.name))
+					return resp, nil
+				}
+				lastResponse = resp
+			} else {
+				lastErr = err
 			}
-			lastResponse = resp
-		} else {
-			lastErr = err
-		}
 
-		if proxyFailed {
-			if nodes.Proxy(node) == proxy {
+			if proxyFailed {
+				if nodes.Proxy(node) == proxy {
+					nodes.MarkFailure(node, resp, err)
+				}
+			} else {
 				nodes.MarkFailure(node, resp, err)
 			}
-		} else {
-			nodes.MarkFailure(node, resp, err)
+			if err != nil {
+				g.logger.Debug("upstream transport error", "request_id", ids.Request, "tier", route.Tier, "proxy", redactURL(proxy.name), "error", err)
+			} else {
+				g.logger.Debug("upstream rejected request", "request_id", ids.Request, "status", resp.StatusCode, "proxy", redactURL(proxy.name), "tier", route.Tier)
+			}
 		}
-		if err != nil {
-			g.logger.Debug("upstream transport error", "request_id", ids.Request, "tier", route.Tier, "proxy", redactURL(proxy.name), "error", err)
-		} else {
-			g.logger.Debug("upstream rejected request", "request_id", ids.Request, "status", resp.StatusCode, "proxy", redactURL(proxy.name), "tier", route.Tier)
-		}
+		break
 	}
 
 	if lastResponse != nil {
@@ -445,12 +554,41 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 	if lastErr != nil {
 		return nil, lastErr
 	}
-	return nil, fmt.Errorf("all %s nodes cooling down or unavailable", route.Tier)
+	return nil, errAllCooling
+}
+
+// throttleError carries the upstream rate-limit window so the gateway can
+// answer 503 with a Retry-After header instead of leaving the client guessing.
+type throttleError struct {
+	retryAfter time.Duration
+}
+
+func (e *throttleError) Error() string {
+	return fmt.Sprintf("upstream account rate limited, retry after %s", e.retryAfter.Round(time.Second))
+}
+
+// sleepCtx sleeps for d or until ctx is done, reporting whether it completed.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return true
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 // errQuotaExhausted signals that every account key in the pool is cooling down
 // after hitting upstream quota limits.
 var errQuotaExhausted = errors.New("all upstream keys exhausted their quota")
+
+// errAllCooling signals that every key is cooling down or unavailable for a
+// reason other than quota (rate limits, account rejections, transport errors).
+var errAllCooling = errors.New("all upstream keys cooling down or unavailable")
 
 // accountRejectCooldown cools keys rejected with 401/403 (invalid key, no
 // payment method). The condition is stable, so a long cooldown keeps the key
