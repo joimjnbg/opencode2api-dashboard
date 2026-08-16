@@ -168,6 +168,14 @@ type upstreamNode struct {
 	lastRemaining  atomic.Int64
 	machineID      string
 	vscodeMachine  string
+	// Per-account throttle state, used only in multi-account mode where the
+	// pool holds keys from distinct upstream accounts. A 429 on one account
+	// throttles only its own key instead of the whole pool.
+	throttleUntil atomic.Int64
+	throttleHits  atomic.Uint32
+	// parkedUntil marks a quota-exhausted account as out of rotation until its
+	// free-tier quota window resets.
+	parkedUntil atomic.Int64
 }
 
 type nodePool struct {
@@ -186,6 +194,13 @@ type nodePool struct {
 	throttleHits  atomic.Uint32
 	last429Mu     sync.Mutex
 	last429Seen   []int64 // unixnano per node index
+	// multiAccount marks the pool as containing keys from distinct upstream
+	// accounts. This changes throttle scope (per-key instead of per-pool) and
+	// rotation (fair spread instead of session affinity).
+	multiAccount bool
+	// fairNext rotates the fair-rotation cursor independently of the model
+	// refresh cursor, so background refreshes cannot perturb request spread.
+	fairNext atomic.Uint64
 }
 
 // newNodePool distributes keys over proxies in round-robin order. When there
@@ -244,6 +259,59 @@ func (p *nodePool) RestoreProxy(recoveredProxy int) int {
 
 func (p *nodePool) Len() int { return len(p.nodes) }
 
+// SetMultiAccount enables per-account throttle scope and fair rotation.
+func (p *nodePool) SetMultiAccount(enabled bool) {
+	p.multiAccount = enabled
+}
+
+// nodeBusyUntil returns the latest future deadline among the node's cooldown,
+// throttle and park windows (zero when the node is eligible for rotation).
+func (p *nodePool) nodeBusyUntil(node *upstreamNode, now int64) int64 {
+	if node == nil {
+		return 0
+	}
+	var until int64
+	for _, candidate := range []*atomic.Int64{&node.cooldownUntil, &node.throttleUntil, &node.parkedUntil} {
+		if value := candidate.Load(); value > until {
+			until = value
+		}
+	}
+	if until <= now {
+		return 0
+	}
+	return until
+}
+
+// nodeEligible reports whether a node may serve traffic: no busy window and a
+// healthy proxy binding.
+func (p *nodePool) nodeEligible(node *upstreamNode, now int64) bool {
+	if p == nil || node == nil {
+		return false
+	}
+	if p.nodeBusyUntil(node, now) != 0 {
+		return false
+	}
+	if p.transports != nil {
+		if proxy := p.transports.items[int(node.proxyIndex.Load())]; proxy != nil && !proxy.healthy.Load() {
+			return false
+		}
+	}
+	return true
+}
+
+// activeNodesLocked orders the nodes that are currently eligible for rotation.
+// start is the first node index tried; the order wraps around.
+func (p *nodePool) activeNodesLocked(start int, now int64) []*upstreamNode {
+	out := make([]*upstreamNode, 0, len(p.nodes))
+	for offset := 0; offset < len(p.nodes); offset++ {
+		index := (start + offset) % len(p.nodes)
+		if node := p.nodes[index]; p.nodeEligible(node, now) {
+			out = append(out, node)
+		}
+	}
+	return out
+}
+
 func (p *nodePool) Proxy(node *upstreamNode) *proxyTransport {
 	if p == nil || node == nil || p.transports == nil {
 		return nil
@@ -287,6 +355,51 @@ func (p *nodePool) MarkAccountRejected(node *upstreamNode, cooldown time.Duratio
 	}
 	node.failures.Store(0)
 	node.cooldownUntil.Store(time.Now().Add(cooldown).UnixNano())
+}
+
+// MarkNodeThrottled opens an exponential per-account throttle window on one
+// key. Used in multi-account mode where the upstream rate-limits each account
+// independently: the affected account backs off while the rest keep serving.
+func (p *nodePool) MarkNodeThrottled(node *upstreamNode, cfg ThrottleConfig) {
+	if node == nil {
+		return
+	}
+	window := time.Duration(cfg.InitialSeconds) * time.Second
+	if window <= 0 {
+		window = 60 * time.Second
+	}
+	hits := node.throttleHits.Add(1)
+	if max := time.Duration(cfg.MaxSeconds) * time.Second; max > 0 {
+		if window*time.Duration(1<<min(hits-1, 8)) > max {
+			window = max
+		} else {
+			window *= time.Duration(1 << min(hits-1, 8))
+		}
+	}
+	node.throttleUntil.Store(time.Now().Add(window).UnixNano())
+}
+
+// ClearNodeThrottle lifts a per-account throttle after a successful probe.
+func (p *nodePool) ClearNodeThrottle(node *upstreamNode) {
+	if node == nil {
+		return
+	}
+	node.throttleUntil.Store(0)
+	node.throttleHits.Store(0)
+}
+
+// MarkQuotaParked parks a quota-exhausted account out of rotation until its
+// free-tier quota window resets instead of only cooling it briefly. The park
+// is not exponential and never clears early: the account really ran out of
+// daily quota, so it must not re-enter rotation until the window elapses. Only
+// the parked state is written, so Cooling()/Cooling metrics keep counting
+// plain cooldowns and the parked gauge stays authoritative for parking.
+func (p *nodePool) MarkQuotaParked(node *upstreamNode, window time.Duration) {
+	if node == nil {
+		return
+	}
+	node.failures.Store(0)
+	node.parkedUntil.Store(time.Now().Add(window).UnixNano())
 }
 
 // ThrottleDeadline returns when the account-level throttle window ends
@@ -367,42 +480,63 @@ func (p *nodePool) StatusSnapshot() []keyStatus {
 		return nil
 	}
 	now := time.Now().UnixNano()
-	throttled := p.throttleUntil.Load() > now
+	poolThrottled := !p.multiAccount && p.throttleUntil.Load() > now
 	out := make([]keyStatus, 0, len(p.nodes))
 	for _, node := range p.nodes {
-		until := node.cooldownUntil.Load()
-		state := "active"
-		if throttled {
-			state = "throttled"
-		} else if until > now {
-			state = "cooling"
-		}
-		out = append(out, keyStatus{Index: node.index, State: state, CooldownUntil: until})
+		state := p.nodeState(node, now, poolThrottled)
+		out = append(out, keyStatus{Index: node.index, State: state, CooldownUntil: p.nodeBusyUntil(node, now)})
 	}
 	return out
 }
 
-// EarliestCooldown returns the soonest key cooldown expiry (zero time when no
-// node is cooling down).
-func (p *nodePool) EarliestCooldown() time.Time {
+// nodeState reports the canonical state of one node for health consumers.
+func (p *nodePool) nodeState(node *upstreamNode, now int64, poolThrottled bool) string {
+	if p.multiAccount {
+		if node.parkedUntil.Load() > now {
+			return "parked"
+		}
+		if node.throttleUntil.Load() > now {
+			return "throttled"
+		}
+		if node.cooldownUntil.Load() > now {
+			return "cooling"
+		}
+		return "active"
+	}
+	if poolThrottled {
+		return "throttled"
+	}
+	if node.cooldownUntil.Load() > now {
+		return "cooling"
+	}
+	return "active"
+}
+
+// EarliestBusy returns the soonest expiry across all per-node busy windows
+// (cooldown, throttle, park). Zero time when no node is busy.
+func (p *nodePool) EarliestBusy() time.Time {
 	if p == nil {
 		return time.Time{}
 	}
 	now := time.Now().UnixNano()
 	var earliest int64
 	for _, node := range p.nodes {
-		until := node.cooldownUntil.Load()
-		if until <= now {
-			continue
-		}
-		if earliest == 0 || until < earliest {
-			earliest = until
+		if until := p.nodeBusyUntil(node, now); until != 0 {
+			if earliest == 0 || until < earliest {
+				earliest = until
+			}
 		}
 	}
 	if earliest == 0 {
 		return time.Time{}
 	}
 	return time.Unix(0, earliest)
+}
+
+// EarliestCooldown is the legacy name for EarliestBusy, kept so existing call
+// sites and tests read naturally regardless of which window is busy.
+func (p *nodePool) EarliestCooldown() time.Time {
+	return p.EarliestBusy()
 }
 
 // ObserveRateLimit records the upstream x-ratelimit-remaining header. When
@@ -461,35 +595,65 @@ func (p *nodePool) ActiveNodeCount() int {
 	return count
 }
 
-// ActiveOrder returns the nodes that are not currently cooled down, ordered
-// from a stable cursor position for the supplied affinity key. When every node
-// is cooling down the returned slice is empty.
+// ThrottledKeyCount returns how many nodes are currently in a per-account
+// throttle window (multi-account mode).
+func (p *nodePool) ThrottledKeyCount() int {
+	if p == nil {
+		return 0
+	}
+	now := time.Now().UnixNano()
+	count := 0
+	for _, node := range p.nodes {
+		if node.throttleUntil.Load() > now {
+			count++
+		}
+	}
+	return count
+}
+
+// Parked returns how many nodes are currently parked out of rotation by quota
+// exhaustion (multi-account mode).
+func (p *nodePool) Parked() int {
+	if p == nil {
+		return 0
+	}
+	now := time.Now().UnixNano()
+	count := 0
+	for _, node := range p.nodes {
+		if node.parkedUntil.Load() > now {
+			count++
+		}
+	}
+	return count
+}
+
+// ActiveOrder returns the nodes that are currently eligible for rotation,
+// ordered from a stable cursor position for the supplied affinity key. In
+// single-account mode eligibility means not cooling down; in multi-account
+// mode it also excludes per-account throttled and parked nodes. When every
+// node is busy the returned slice is empty.
 func (p *nodePool) ActiveOrder(affinity string) []*upstreamNode {
 	if p == nil || len(p.nodes) == 0 {
 		return nil
 	}
-	now := time.Now().UnixNano()
 	start := 0
-	if affinity != "" {
+	if affinity != "" && !p.multiAccount {
 		hash := fnv.New64a()
 		_, _ = hash.Write([]byte(affinity))
 		start = int(hash.Sum64() % uint64(len(p.nodes)))
 	}
-	out := make([]*upstreamNode, 0, len(p.nodes))
-	for offset := 0; offset < len(p.nodes); offset++ {
-		index := (start + offset) % len(p.nodes)
-		node := p.nodes[index]
-		if node.cooldownUntil.Load() > now {
-			continue
-		}
-		if p.transports != nil {
-			if proxy := p.transports.items[int(node.proxyIndex.Load())]; proxy != nil && !proxy.healthy.Load() {
-				continue
-			}
-		}
-		out = append(out, node)
+	return p.activeNodesLocked(start, time.Now().UnixNano())
+}
+
+// ActiveOrderFair returns the eligible nodes ordered from a rotating cursor,
+// so consecutive requests spread across accounts. Used in multi-account mode
+// where session affinity must not pin a conversation to one account.
+func (p *nodePool) ActiveOrderFair() []*upstreamNode {
+	if p == nil || len(p.nodes) == 0 {
+		return nil
 	}
-	return out
+	start := int((p.fairNext.Add(1) - 1) % uint64(len(p.nodes)))
+	return p.activeNodesLocked(start, time.Now().UnixNano())
 }
 
 // RebindProxy moves every key currently using failedProxy to the least-loaded
@@ -587,8 +751,8 @@ func (c *nodeCursor) Next() *upstreamNode {
 	var earliest int64
 	for offset := 0; offset < len(c.pool.nodes); offset++ {
 		i := (c.next + offset) % len(c.pool.nodes)
-		until := c.pool.nodes[i].cooldownUntil.Load()
-		if until <= now {
+		until := c.pool.nodeBusyUntil(c.pool.nodes[i], now)
+		if until <= 0 {
 			choice = i
 			break
 		}
@@ -604,8 +768,18 @@ func (c *nodeCursor) Next() *upstreamNode {
 }
 
 func (p *nodePool) MarkSuccess(node *upstreamNode) {
+	if node == nil {
+		return
+	}
 	node.failures.Store(0)
 	node.cooldownUntil.Store(0)
+	if p.multiAccount {
+		// A successful probe lifts a per-account throttle. Parked accounts
+		// never receive requests until their park window elapses, so a success
+		// here means the park had already expired and the account rejoined
+		// rotation on its own.
+		p.ClearNodeThrottle(node)
+	}
 }
 
 func (p *nodePool) MarkFailure(node *upstreamNode, resp *http.Response, err error) {

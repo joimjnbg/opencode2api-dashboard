@@ -93,6 +93,8 @@ func NewGateway(cfg Config, logger *slog.Logger) (*Gateway, error) {
 		catalog:    newModelCatalog(cfg.Prefer, cfg.Models.Protocols),
 		stats:      newUsageStats(),
 	}
+	zenNodes.SetMultiAccount(cfg.Failover.MultiAccount)
+	goNodes.SetMultiAccount(cfg.Failover.MultiAccount)
 	if cfg.Fingerprint.Enabled {
 		gateway.fingerprint = newFingerprintStore(cfg.Fingerprint.PersistFile)
 		zenNodes.SetFingerprints(gateway.fingerprint)
@@ -311,6 +313,9 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			case errors.Is(err, errQuotaExhausted):
 				g.logger.Warn("all upstream keys in quota cooldown", "request_id", ids.Request, "tier", route.Tier, "model", model)
 				g.stats.Record(model, bridgeUsage{}, 0, false)
+				if retry := g.quotaRetryAfter(route.Tier); retry > 0 {
+					w.Header().Set("Retry-After", fmt.Sprintf("%d", retry))
+				}
 				writeAPIError(w, external, http.StatusServiceUnavailable, "all upstream keys are cooling down due to quota limits; retry later", "rate_limit_exceeded", ids.Request)
 				return
 			case errors.Is(err, errAllCooling):
@@ -417,6 +422,9 @@ requestLoop:
 		}
 
 		active := nodes.ActiveOrder(ids.Session)
+		if g.cfg.Failover.MultiAccount {
+			active = nodes.ActiveOrderFair()
+		}
 		if len(active) == 0 {
 			if earliest := nodes.EarliestCooldown(); !earliest.IsZero() && !earliest.After(deadline) {
 				g.logger.Debug("all keys cooling down, holding request", "request_id", ids.Request, "tier", route.Tier, "wait_seconds", int(time.Until(earliest).Seconds()))
@@ -487,9 +495,18 @@ requestLoop:
 				// (4xx passthrough, lastResponse fallback) can still read it.
 				resp.Body = io.NopCloser(bytes.NewReader(captured.body))
 				if isQuotaError(captured.status, captured.body, g.cfg.Failover) {
-					nodes.MarkQuotaExceeded(node, quotaCooldown)
+					if g.cfg.Failover.MultiAccount && g.cfg.Failover.QuotaParkMinutes > 0 {
+						// Daily free-quota cap: park the account out of rotation
+						// for the quota window instead of the short cooldown, so
+						// it stops wasting the remaining accounts' retries.
+						park := time.Duration(g.cfg.Failover.QuotaParkMinutes) * time.Minute
+						nodes.MarkQuotaParked(node, park)
+						g.logger.Warn("upstream account quota exhausted, parking until quota window", "request_id", ids.Request, "tier", route.Tier, "status", captured.status, "park_minutes", g.cfg.Failover.QuotaParkMinutes, "proxy", redactURL(proxy.name))
+					} else {
+						nodes.MarkQuotaExceeded(node, quotaCooldown)
+						g.logger.Warn("upstream quota exceeded, silent failover", "request_id", ids.Request, "tier", route.Tier, "status", captured.status, "proxy", redactURL(proxy.name))
+					}
 					anyQuota = true
-					g.logger.Warn("upstream quota exceeded, silent failover", "request_id", ids.Request, "tier", route.Tier, "status", captured.status, "proxy", redactURL(proxy.name))
 					continue
 				}
 				// Account-level rejections (bad key, no payment method) are
@@ -504,12 +521,24 @@ requestLoop:
 					g.logger.Warn("upstream rejected key, silent failover", "request_id", ids.Request, "tier", route.Tier, "status", captured.status, "proxy", redactURL(proxy.name))
 					continue
 				}
-				// A 429 cools this key, but when distinct keys of the same
-				// pool hit 429 inside the shared window the upstream is rate
-				// limiting the whole account: key rotation cannot help, so
-				// the pool enters a throttle window and the request is held
-				// (backpressure) until it elapses.
+				// A 429 cools this key. In single-account mode, distinct keys of
+				// the same pool hitting 429 inside the shared window prove the
+				// upstream is rate limiting the whole account: key rotation
+				// cannot help, so the pool enters a throttle window and the
+				// request is held (backpressure) until it elapses. In
+				// multi-account mode each key is its own account, so a 429
+				// throttles only that key and the others keep serving.
 				if captured.status == http.StatusTooManyRequests {
+					if g.cfg.Failover.MultiAccount {
+						nodes.MarkFailure(node, resp, err)
+						nodes.MarkNodeThrottled(node, g.cfg.Failover.Throttle)
+						g.logger.Debug("account rate limited, cooling account only", "request_id", ids.Request, "tier", route.Tier, "proxy", redactURL(proxy.name))
+						// Re-evaluate: the throttled account drops out of rotation
+						// and, when every account is limited, the pool holds until
+						// the earliest throttle window elapses (backpressure) and
+						// probes once, exactly like the pooled throttle path.
+						continue requestLoop
+					}
 					nodes.MarkFailure(node, resp, err)
 					if nodes.Record429(node, sharedWindow, g.cfg.Failover.Throttle.Shared429Threshold) {
 						nodes.MarkAccountThrottled(g.cfg.Failover.Throttle)
@@ -565,6 +594,28 @@ type throttleError struct {
 
 func (e *throttleError) Error() string {
 	return fmt.Sprintf("upstream account rate limited, retry after %s", e.retryAfter.Round(time.Second))
+}
+
+// quotaRetryAfter returns whole seconds until the tier's keys are expected to
+// be available again, so a 503 from every-key-quota carries a useful
+// Retry-After instead of a bare 503.
+func (g *Gateway) quotaRetryAfter(tier Tier) int {
+	nodes := g.zenNodes
+	if tier == TierGo {
+		nodes = g.goNodes
+	}
+	if nodes == nil {
+		return 0
+	}
+	earliest := nodes.EarliestBusy()
+	if earliest.IsZero() {
+		return 0
+	}
+	seconds := int(time.Until(earliest).Seconds()) + 1
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
 }
 
 // sleepCtx sleeps for d or until ctx is done, reporting whether it completed.

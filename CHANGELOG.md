@@ -4,7 +4,11 @@
 
 ## [Unreleased]
 
-- 暂无
+### 新增
+
+- **多账号池（`failover.multi_account`）**：适用于一个池内配置了多个不同 opencode 账号 key 的场景。每个 key 视为独立账号——429 只冷却/限流该账号本身，不再误判整个池为共享账号限流；请求按轮转公平地分摊到各账号（不再把整段对话钉在单一账号上，避免某账号额度先耗尽）。
+- **额度耗尽停用（`failover.quota_park_minutes`）**：多账号模式下，账号确认触发免费额度上限后按窗口停用（默认 1440 分钟，即一天）直到额度窗口重置，而不是仅短暂冷却反复空转；窗口到期后自动重新参与轮转，恢复即回池。
+- **新状态与指标**：`/healthz` 每个 key 的状态新增 `parked`（额度停用）与逐账号 `throttled`；新增 Prometheus 指标 `opencode2api_keys_throttled_total`、`opencode2api_keys_parked_total`。
 
 ## [v3.1.0] - 2026-08-15
 

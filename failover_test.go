@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -20,6 +21,8 @@ type fakeUpstream struct {
 	// returns 200 with a canned chat completion.
 	keyAnswers map[string]int
 	seenKeys   atomic.Int32
+	perKeyMu   sync.Mutex
+	perKey     map[string]int
 	machineIDs map[string]string
 	// quotaFirst makes the first observed request return a quota error and
 	// everything afterwards succeed, regardless of which key is selected.
@@ -35,11 +38,32 @@ func newFakeUpstream(answers map[string]int) *fakeUpstream {
 	return f
 }
 
+// PerKeyCounts returns how many requests reached each upstream key.
+func (f *fakeUpstream) PerKeyCounts() map[string]int {
+	f.perKeyMu.Lock()
+	defer f.perKeyMu.Unlock()
+	out := make(map[string]int, len(f.perKey))
+	for k, v := range f.perKey {
+		out[k] = v
+	}
+	return out
+}
+
+func (f *fakeUpstream) recordKey(key string) {
+	f.perKeyMu.Lock()
+	if f.perKey == nil {
+		f.perKey = map[string]int{}
+	}
+	f.perKey[key]++
+	f.perKeyMu.Unlock()
+}
+
 func (f *fakeUpstream) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		key := strings.TrimPrefix(auth, "Bearer ")
 		f.machineIDs[key] = r.Header.Get("x-machine-id")
+		f.recordKey(key)
 
 		status, known := f.keyAnswers[key]
 		if !known || status == 0 {

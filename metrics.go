@@ -81,22 +81,32 @@ func (g *Gateway) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintf(&out, "opencode2api_keys_total %d\n", keys)
 
 	zenCooling, goCooling := g.zenNodes.Cooling(), g.goNodes.Cooling()
+	zenThrottled, goThrottled := g.zenNodes.ThrottledKeyCount(), g.goNodes.ThrottledKeyCount()
+	zenParked, goParked := g.zenNodes.Parked(), g.goNodes.Parked()
 	fmt.Fprintf(&out, "# HELP opencode2api_keys_cooling_total Upstream keys currently cooling down\n")
 	out.WriteString("# TYPE opencode2api_keys_cooling_total gauge\n")
 	fmt.Fprintf(&out, "opencode2api_keys_cooling_total{tier=\"zen\"} %d\n", zenCooling)
 	fmt.Fprintf(&out, "opencode2api_keys_cooling_total{tier=\"go\"} %d\n", goCooling)
+	fmt.Fprintf(&out, "# HELP opencode2api_keys_throttled_total Upstream keys in a per-account throttle window\n")
+	out.WriteString("# TYPE opencode2api_keys_throttled_total gauge\n")
+	fmt.Fprintf(&out, "opencode2api_keys_throttled_total{tier=\"zen\"} %d\n", zenThrottled)
+	fmt.Fprintf(&out, "opencode2api_keys_throttled_total{tier=\"go\"} %d\n", goThrottled)
+	fmt.Fprintf(&out, "# HELP opencode2api_keys_parked_total Upstream accounts parked out of rotation by quota exhaustion\n")
+	out.WriteString("# TYPE opencode2api_keys_parked_total gauge\n")
+	fmt.Fprintf(&out, "opencode2api_keys_parked_total{tier=\"zen\"} %d\n", zenParked)
+	fmt.Fprintf(&out, "opencode2api_keys_parked_total{tier=\"go\"} %d\n", goParked)
 
-	zenThrottled, goThrottled := 0, 0
+	poolZenThrottled, poolGoThrottled := 0, 0
 	if !g.zenNodes.ThrottleDeadline().IsZero() {
-		zenThrottled = 1
+		poolZenThrottled = 1
 	}
 	if !g.goNodes.ThrottleDeadline().IsZero() {
-		goThrottled = 1
+		poolGoThrottled = 1
 	}
 	fmt.Fprintf(&out, "# HELP opencode2api_account_throttled 1 while the account-level rate-limit window is active\n")
 	out.WriteString("# TYPE opencode2api_account_throttled gauge\n")
-	fmt.Fprintf(&out, "opencode2api_account_throttled{tier=\"zen\"} %d\n", zenThrottled)
-	fmt.Fprintf(&out, "opencode2api_account_throttled{tier=\"go\"} %d\n", goThrottled)
+	fmt.Fprintf(&out, "opencode2api_account_throttled{tier=\"zen\"} %d\n", poolZenThrottled)
+	fmt.Fprintf(&out, "opencode2api_account_throttled{tier=\"go\"} %d\n", poolGoThrottled)
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	_, _ = w.Write([]byte(out.String()))

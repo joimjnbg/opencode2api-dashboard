@@ -86,6 +86,15 @@ type FailoverConfig struct {
 	QuotaCooldownMinutes   int            `json:"quota_cooldown_minutes"`
 	TreatGeneric429AsQuota bool           `json:"treat_generic_429_as_quota"`
 	Throttle               ThrottleConfig `json:"throttle"`
+	// MultiAccount marks the pool as containing keys from distinct upstream
+	// accounts. Upstreams then rate-limit per account, so 429s must cool only
+	// the affected key instead of throttling the whole pool, and session
+	// affinity must not pin every turn of a conversation to one account.
+	MultiAccount bool `json:"multi_account"`
+	// QuotaParkMinutes parks a quota-exhausted account out of rotation for the
+	// remainder of the free-tier quota window instead of the short cooldown.
+	// Zero disables parking and keeps the existing quota cooldown behaviour.
+	QuotaParkMinutes int `json:"quota_park_minutes"`
 }
 
 // ThrottleConfig tunes the account-level rate-limit circuit breaker.
@@ -200,6 +209,9 @@ func LoadConfig(path string) (Config, error) {
 		default:
 			return Config{}, fmt.Errorf("unsupported proxy scheme %q", u.Scheme)
 		}
+	}
+	if cfg.Failover.QuotaParkMinutes < 0 {
+		return Config{}, errors.New("failover.quota_park_minutes must not be negative")
 	}
 	for model, protocol := range cfg.Models.Protocols {
 		if model == "" || !validProtocol(Protocol(protocol)) {
