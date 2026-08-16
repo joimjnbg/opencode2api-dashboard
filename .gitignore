@@ -1,5 +1,8 @@
 .key
 config.json
+config.json.bak
+opencode.json
+fingerprints.json
 .env
 opencode/
 opencode2api

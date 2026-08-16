@@ -1,6 +1,161 @@
 import { createServer } from "node:http";
-import { readFileSync, statSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, statSync, existsSync, writeFileSync, copyFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { homedir } from "node:os";
+import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
+
+// ---- config management ----------------------------------------------------
+// Targets:
+//   gateway         -> <dir>/config.json            (opencode2api gateway)
+//   opencode-global -> ~/.config/opencode/opencode.json
+//   opencode-user   -> <dir>/opencode.json          (project-level, next to gateway)
+const CONFIG_TARGETS = {
+  "gateway": {
+    label: "网关配置 (config.json)",
+    path: () => join(import.meta.dirname, "config.json"),
+    restartOnSave: true,
+  },
+  "opencode-global": {
+    label: "opencode 全局配置 (~/.config/opencode/opencode.json)",
+    path: () => join(homedir(), ".config", "opencode", "opencode.json"),
+    restartOnSave: false,
+  },
+  "opencode-user": {
+    label: "opencode 用户配置 (项目 opencode.json)",
+    path: () => join(import.meta.dirname, "opencode.json"),
+    restartOnSave: false,
+  },
+};
+
+function maskKey(key) {
+  if (!key || key.length <= 8) return "********";
+  return key.slice(0, 4) + "****" + key.slice(-4);
+}
+
+function unmaskKeys(list, current) {
+  return (list || []).map((k, i) => {
+    if (typeof k !== "string") return k;
+    if (k.includes("****") && current && current[i]) return current[i];
+    return k;
+  });
+}
+
+function redactConfig(cfg) {
+  const out = JSON.parse(JSON.stringify(cfg || {}));
+  for (const field of ["server_keys", "zen_keys", "go_keys"]) {
+    if (Array.isArray(out[field])) out[field] = out[field].map(maskKey);
+  }
+  if (out.provider && out.provider.zen2api && out.provider.zen2api.options) {
+    const opt = out.provider.zen2api.options;
+    if (opt.apiKey) opt.apiKey = maskKey(opt.apiKey);
+  }
+  return out;
+}
+
+function readTarget(target) {
+  const spec = CONFIG_TARGETS[target];
+  if (!spec) return { error: "unknown target" };
+  const path = spec.path();
+  if (!existsSync(path)) return { error: "not_found", path, label: spec.label };
+  let cfg;
+  try {
+    cfg = JSON.parse(readFileSync(path, "utf8"));
+  } catch (e) {
+    return { error: "parse_error", detail: String(e.message), path, label: spec.label };
+  }
+  return { ok: true, path, label: spec.label, target, config: redactConfig(cfg) };
+}
+
+async function writeTarget(target, rawConfig) {
+  const spec = CONFIG_TARGETS[target];
+  if (!spec) return { error: "unknown target" };
+  const path = spec.path();
+  let newCfg;
+  try {
+    newCfg = JSON.parse(rawConfig);
+  } catch (e) {
+    return { error: "parse_error", detail: String(e.message) };
+  }
+  let current = {};
+  if (existsSync(path)) {
+    try { current = JSON.parse(readFileSync(path, "utf8") || "{}"); } catch { current = {}; }
+  } else if (!newCfg.provider) {
+    // Brand-new opencode config: seed a minimal valid structure.
+    newCfg = {
+      "$schema": "https://opencode.ai/config.json",
+      model: "zen2api/deepseek-v4-flash-free",
+      provider: { zen2api: { npm: "@ai-sdk/openai-compatible", name: "Zen Local (opencode2api)", options: { baseURL: "http://127.0.0.1:8080/v1", apiKey: "" }, models: {} } },
+    };
+  }
+
+  // Restore real keys when the client sent masked placeholders.
+  for (const field of ["server_keys", "zen_keys", "go_keys"]) {
+    if (Array.isArray(newCfg[field]) && Array.isArray(current[field])) {
+      newCfg[field] = unmaskKeys(newCfg[field], current[field]);
+    }
+  }
+  if (newCfg.provider && newCfg.provider.zen2api && newCfg.provider.zen2api.options && current.provider?.zen2api?.options) {
+    const apiKey = newCfg.provider.zen2api.options.apiKey;
+    if (typeof apiKey === "string" && apiKey.includes("****")) {
+      newCfg.provider.zen2api.options.apiKey = current.provider.zen2api.options.apiKey;
+    }
+  }
+
+  // Backup before overwriting.
+  const backup = path + ".bak";
+  try { copyFileSync(path, backup); } catch {}
+
+  try {
+    writeFileSync(path, JSON.stringify(newCfg, null, 2) + "\n", "utf8");
+  } catch (e) {
+    return { error: "write_error", detail: String(e.message) };
+  }
+
+  // Validate gateway config by asking the running gateway to parse it is not
+  // possible without a reload; the restart below will surface problems.
+  return { ok: true, path, target, backup, restarted: false };
+}
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// Restart the gateway process (Windows). Kills opencode2api.exe, then spawns
+// a fresh detached instance from the gateway directory.
+async function restartGateway() {
+  const exe = join(import.meta.dirname, "opencode2api.exe");
+  if (!existsSync(exe)) return { error: "gateway exe not found" };
+  const results = [];
+  await new Promise((resolve) => {
+    execFile("taskkill", ["/IM", "opencode2api.exe", "/F"], { windowsHide: true }, (err, _stdout, stderr) => {
+      results.push(err ? `kill: ${(stderr || err.message || "").trim() || "no process"}` : "kill ok");
+      resolve();
+    });
+  });
+  await sleep(1200);
+  const logOut = join(import.meta.dirname, "opencode2api.log");
+  const logErr = join(import.meta.dirname, "opencode2api.err.log");
+  const child = spawn(exe, [], {
+    cwd: import.meta.dirname,
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  child.unref();
+  results.push("spawned");
+  return { ok: true, detail: results.join("; "), log: logOut, err: logErr };
+}
+
+// Test a server key against the local gateway /v1/models endpoint.
+async function testKey(key) {
+  const inst = instances[0] || {};
+  const base = inst.health ? inst.health.replace(/\/healthz$/, "") : "http://127.0.0.1:8080";
+  try {
+    const r = await fetch(`${base}/v1/models`, { headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(5000) });
+    return { ok: r.ok, status: r.status };
+  } catch (e) {
+    return { ok: false, status: 0, detail: String(e.message || e) };
+  }
+}
 
 // ---- env helpers ----------------------------------------------------------
 function loadEnv() {
@@ -287,22 +442,104 @@ async function handleApiHealth(res) {
   res.end(JSON.stringify({ instances: results, fetched: Date.now() }));
 }
 
+async function handleApiModels(res) {
+  // Real-time model list straight from the gateway /v1/models (no caching).
+  const inst = instances[0] || {};
+  const base = inst.health ? inst.health.replace(/\/healthz$/, "") : "http://127.0.0.1:8080";
+  const url = `${base}/v1/models`;
+  try {
+    const headers = {};
+    if (inst.key) headers["Authorization"] = `Bearer ${inst.key}`;
+    const r = await fetch(url, { headers, signal: AbortSignal.timeout(5000) });
+    const data = await r.json();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: r.ok, status: r.status, models: (data.data || []).map((m) => m.id), fetched: Date.now() }));
+  } catch (e) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: false, error: String(e.message || e), fetched: Date.now() }));
+  }
+}
+
+async function handleApiConfig(req, res, url) {
+  const target = url.searchParams.get("target") || "gateway";
+  const result = readTarget(target);
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ ...result, fetched: Date.now() }));
+}
+
+async function handleApiSaveConfig(req, res, url) {
+  const target = url.searchParams.get("target") || "gateway";
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  const body = Buffer.concat(chunks).toString("utf8");
+  const result = await writeTarget(target, body);
+  if (result.ok) {
+    const spec = CONFIG_TARGETS[target];
+    if (spec && spec.restartOnSave) {
+      const rst = await restartGateway();
+      result.restarted = rst.ok;
+      result.restartDetail = rst.detail || rst.error;
+    }
+  }
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ ...result, fetched: Date.now() }));
+}
+
+async function handleApiRestart(req, res) {
+  const result = await restartGateway();
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ ...result, fetched: Date.now() }));
+}
+
+async function handleApiTestKey(req, res) {
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  let key = "";
+  try {
+    key = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}").key || "";
+  } catch {}
+  const result = key ? await testKey(key) : { ok: false, status: 0, detail: "no key provided" };
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ ...result, fetched: Date.now() }));
+}
+
+async function handleApiAuditRecent(res, url) {
+  const limit = Math.min(Number(url.searchParams.get("limit") || 50), 500);
+  const history = readAuditHistory();
+  const entries = history.entries.slice(-limit).reverse();
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ entries, total_lines: history.total_lines, fetched: Date.now() }));
+}
+
 // ---- server ---------------------------------------------------------------
 const html = readFileSync(join(import.meta.dirname, "dashboard.html"), "utf8")
   .replaceAll("window.__COST_LIMIT__ || 0", `window.__COST_LIMIT__ || ${COST_LIMIT}`);
 
 createServer(async (req, res) => {
-  if (req.url === "/" || req.url === "/index.html") {
+  const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+  const path = url.pathname;
+  if (path === "/" || path === "/index.html") {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     res.end(html);
-  } else if (req.url === "/api/stats") {
+  } else if (path === "/api/stats") {
     await handleApiStats(res);
-  } else if (req.url === "/api/gateway-stats") {
+  } else if (path === "/api/gateway-stats") {
     await handleApiGatewayStats(res);
-  } else if (req.url === "/api/audit") {
+  } else if (path === "/api/audit") {
     await handleApiAudit(res);
-  } else if (req.url === "/api/health") {
+  } else if (path === "/api/audit-recent") {
+    await handleApiAuditRecent(res, url);
+  } else if (path === "/api/health") {
     await handleApiHealth(res);
+  } else if (path === "/api/models") {
+    await handleApiModels(res);
+  } else if (path === "/api/config") {
+    if (req.method === "POST") await handleApiSaveConfig(req, res, url);
+    else await handleApiConfig(req, res, url);
+  } else if (path === "/api/restart") {
+    await handleApiRestart(req, res);
+  } else if (path === "/api/test-key") {
+    await handleApiTestKey(req, res);
   } else {
     res.writeHead(404);
     res.end("not found");

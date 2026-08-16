@@ -9,7 +9,13 @@
   * { box-sizing:border-box; margin:0; padding:0; }
   body { background:var(--bg); color:var(--text); font-family:"Segoe UI",system-ui,sans-serif; padding:20px; }
   h1 { font-size:20px; margin-bottom:4px; }
-  .sub { color:var(--dim); font-size:12px; margin-bottom:20px; }
+  .sub { color:var(--dim); font-size:12px; margin-bottom:16px; }
+  .tabs { display:flex; gap:8px; margin-bottom:20px; border-bottom:1px solid var(--border); padding-bottom:10px; }
+  .tab { padding:8px 18px; border-radius:8px; cursor:pointer; color:var(--dim); font-size:14px; border:1px solid transparent; user-select:none; }
+  .tab:hover { color:var(--text); background:rgba(88,166,255,.08); }
+  .tab.active { color:var(--blue); background:rgba(88,166,255,.12); border-color:rgba(88,166,255,.3); }
+  .page { display:none; }
+  .page.active { display:block; }
   .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:20px; }
   .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:14px; }
   .card .label { color:var(--dim); font-size:12px; margin-bottom:6px; }
@@ -47,63 +53,175 @@
   .pill.ok { background:rgba(63,185,80,.15); color:var(--green); }
   .pill.err { background:rgba(248,81,73,.15); color:var(--red); }
   .note { color:var(--dim); font-size:12px; margin-top:6px; }
-  .instance-tag { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; margin-right:6px; }
+  .btn { display:inline-block; padding:8px 16px; border-radius:8px; border:1px solid var(--border); background:var(--card); color:var(--text); cursor:pointer; font-size:13px; margin-right:8px; }
+  .btn:hover { border-color:var(--blue); color:var(--blue); }
+  .btn.primary { background:rgba(63,185,80,.15); border-color:rgba(63,185,80,.4); color:var(--green); }
+  .btn.primary:hover { background:rgba(63,185,80,.25); }
+  .btn.danger { background:rgba(248,81,73,.1); border-color:rgba(248,81,73,.4); color:var(--red); }
+  .btn.danger:hover { background:rgba(248,81,73,.2); }
+  .btn:disabled { opacity:.5; cursor:not-allowed; }
+  .btn.small { padding:4px 10px; font-size:12px; }
+  input[type=text],input[type=password],select,textarea { background:#0d1117; border:1px solid var(--border); border-radius:6px; color:var(--text); padding:8px 10px; font-size:13px; width:100%; }
+  input:focus,select:focus,textarea:focus { outline:none; border-color:var(--blue); }
+  label { display:block; color:var(--dim); font-size:12px; margin:12px 0 4px; }
+  .model-list { max-height:400px; overflow-y:auto; border:1px solid var(--border); border-radius:8px; margin-top:10px; }
+  .model-row { display:flex; align-items:center; gap:10px; padding:7px 12px; border-bottom:1px solid var(--border); font-size:13px; }
+  .model-row:last-child { border-bottom:none; }
+  .model-row:hover { background:rgba(88,166,255,.05); }
+  .model-row input[type=checkbox] { accent-color:var(--blue); width:16px; height:16px; }
+  .model-row .mname { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .model-row .mtag { font-size:11px; color:var(--green); background:rgba(63,185,80,.12); padding:1px 8px; border-radius:10px; white-space:nowrap; }
+  .model-row .mtag.off { color:var(--dim); background:transparent; }
+  .toolbar { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:10px; }
+  .toolbar .spacer { flex:1; }
+  .statusbar { color:var(--dim); font-size:12px; margin-top:8px; }
+  .toast { position:fixed; top:16px; right:16px; background:var(--card); border:1px solid var(--border); border-radius:8px; padding:12px 16px; font-size:13px; z-index:99; box-shadow:0 4px 20px rgba(0,0,0,.4); max-width:360px; display:none; }
+  .toast.show { display:block; }
+  .toast.ok { border-color:rgba(63,185,80,.5); }
+  .toast.err { border-color:rgba(248,81,73,.5); }
+  .kv { display:grid; grid-template-columns:180px 1fr; gap:10px; align-items:center; margin-bottom:8px; }
+  .kv .k { color:var(--dim); font-size:12px; }
+  code { background:#0d1117; padding:1px 6px; border-radius:4px; font-size:12px; color:var(--blue); }
+  .hidden { display:none !important; }
 </style>
 </head>
 <body>
 <h1>opencode2api 网关仪表盘</h1>
-<div class="sub">实时流量 + token/cost 用量 + 多实例聚合 · 每 2 秒自动刷新 · 数据源 /healthz + /v1/stats + /metrics + 审计日志</div>
+<div class="sub">实时流量 + token/cost 用量 + 多实例聚合 · 数据源 /healthz + /v1/stats + /metrics + 审计日志</div>
 
-<div class="grid" id="healthCards"></div>
+<div class="tabs">
+  <div class="tab active" data-page="overview" onclick="switchPage('overview')">概览</div>
+  <div class="tab" data-page="models" onclick="switchPage('models')">模型</div>
+  <div class="tab" data-page="settings" onclick="switchPage('settings')">设置</div>
+</div>
 
-<div class="two">
-  <div class="panel">
-    <h2>最近 30 分钟请求量（每分钟）</h2>
-    <div class="bars" id="trend"></div>
-    <div class="legend"><span>蓝色：请求数</span><span id="trendNote"></span></div>
+<div class="toast" id="toast"></div>
+
+<!-- ==================== 概览 ==================== -->
+<div class="page active" id="page-overview">
+  <div class="grid" id="healthCards"></div>
+
+  <div class="two">
+    <div class="panel">
+      <h2>最近 30 分钟请求量（每分钟）</h2>
+      <div class="bars" id="trend"></div>
+      <div class="legend"><span>蓝色：请求数</span><span id="trendNote"></span></div>
+    </div>
+    <div class="panel">
+      <h2>失败状态分布</h2>
+      <div id="statusDist" style="color:var(--dim);font-size:13px;"></div>
+    </div>
   </div>
+
+  <div class="grid" id="usageCards"></div>
+
+  <div class="two">
+    <div class="panel">
+      <h2>按小时 token 用量（聚合）</h2>
+      <div class="bars tokens" id="tokenBars"></div>
+      <div class="legend"><span>紫色：input+cached tokens</span></div>
+    </div>
+    <div class="panel">
+      <h2>按模型用量排行</h2>
+      <div id="modelRank" style="margin-top:4px;"></div>
+    </div>
+  </div>
+
+  <div class="two">
+    <div class="panel">
+      <h2>历史用量趋势（审计日志，按天）</h2>
+      <div class="bars tokens" id="auditBars"></div>
+      <div class="legend"><span id="auditNote"></span><span id="auditExt"></span></div>
+    </div>
+    <div class="panel">
+      <h2>监控端点</h2>
+      <div id="metaPanel" class="note" style="line-height:2;"></div>
+    </div>
+  </div>
+
   <div class="panel">
-    <h2>失败状态分布</h2>
-    <div id="statusDist" style="color:var(--dim);font-size:13px;"></div>
+    <h2>实时请求日志（最新在前）</h2>
+    <table>
+      <thead><tr><th>时间</th><th>级别</th><th>事件</th><th>tier</th><th>代理</th><th>状态</th><th>request_id</th></tr></thead>
+      <tbody id="logRows" class="recent"></tbody>
+    </table>
   </div>
 </div>
 
-<div class="grid" id="usageCards"></div>
-
-<div class="two">
+<!-- ==================== 模型 ==================== -->
+<div class="page" id="page-models">
   <div class="panel">
-    <h2>按小时 token 用量（聚合）</h2>
-    <div class="bars tokens" id="tokenBars"></div>
-    <div class="legend"><span>紫色：input+cached tokens</span></div>
-  </div>
-  <div class="panel">
-    <h2>按模型用量排行</h2>
-    <div id="modelRank" style="margin-top:4px;"></div>
-  </div>
-</div>
-
-<div class="two">
-  <div class="panel">
-    <h2>历史用量趋势（审计日志，按天）</h2>
-    <div class="bars tokens" id="auditBars"></div>
-    <div class="legend"><span id="auditNote"></span><span id="auditExt"></span></div>
-  </div>
-  <div class="panel">
-    <h2>监控端点</h2>
-    <div id="metaPanel" class="note" style="line-height:2;"></div>
+    <div class="toolbar">
+      <h2 style="margin:0">模型选择（每次点击“刷新列表”实时从网关获取）</h2>
+      <div class="spacer"></div>
+      <select id="modelTarget" style="width:auto;min-width:240px;">
+        <option value="opencode-global">写入 opencode 全局配置</option>
+        <option value="opencode-user">写入 opencode 用户配置</option>
+      </select>
+      <button class="btn" onclick="loadModels()">刷新列表</button>
+      <button class="btn primary" onclick="saveModels()">保存模型选择</button>
+    </div>
+    <div class="statusbar" id="modelStatus">点击“刷新列表”实时获取网关模型。</div>
+    <label>筛选：<input type="text" id="modelFilter" placeholder="输入模型名过滤，如 deepseek / free" oninput="renderModelList()"></label>
+    <div class="model-list" id="modelList"></div>
+    <div class="statusbar" id="modelCount"></div>
   </div>
 </div>
 
-<div class="panel">
-  <h2>实时请求日志（最新在前）</h2>
-  <table>
-    <thead><tr><th>时间</th><th>级别</th><th>事件</th><th>tier</th><th>代理</th><th>状态</th><th>request_id</th></tr></thead>
-    <tbody id="logRows" class="recent"></tbody>
-  </table>
+<!-- ==================== 设置 ==================== -->
+<div class="page" id="page-settings">
+  <div class="panel" style="margin-bottom:20px;">
+    <div class="toolbar">
+      <h2 style="margin:0">配置管理</h2>
+      <div class="spacer"></div>
+      <button class="btn danger" onclick="restartGateway()">重启网关</button>
+    </div>
+    <label>配置目标：</label>
+    <select id="configTarget" onchange="loadConfig()">
+      <option value="gateway">网关配置 (config.json)</option>
+      <option value="opencode-global">opencode 全局配置 (~/.config/opencode/opencode.json)</option>
+      <option value="opencode-user">opencode 用户配置 (项目 opencode.json)</option>
+    </select>
+    <div class="statusbar" id="configPath"></div>
+    <label>编辑（JSON，API key 以掩码显示，保存时自动保留原值）：</label>
+    <textarea id="configEditor" rows="18" style="font-family:Consolas,monospace;font-size:12px;" spellcheck="false"></textarea>
+    <div class="toolbar" style="margin-top:12px;">
+      <button class="btn primary" onclick="saveConfig()">保存配置</button>
+      <button class="btn" onclick="loadConfig()">重新加载</button>
+      <button class="btn" onclick="downloadConfig()">下载配置</button>
+      <div class="spacer"></div>
+      <span class="statusbar">保存网关配置后自动重启网关；保存前自动备份 .bak</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>本地 API Key 测试</h2>
+    <div class="kv">
+      <div class="k">Key</div>
+      <input type="text" id="testKeyInput" placeholder="粘贴一个本地 server key 进行测试">
+    </div>
+    <button class="btn" onclick="testKey()">测试 Key</button>
+    <span class="statusbar" id="testKeyResult"></span>
+  </div>
+
+  <div class="panel" style="margin-top:20px;">
+    <h2>最近请求明细（审计日志）</h2>
+    <div class="toolbar">
+      <span class="statusbar" id="auditRecentNote"></span>
+      <div class="spacer"></div>
+      <button class="btn small" onclick="loadAuditRecent(20)">20</button>
+      <button class="btn small" onclick="loadAuditRecent(50)">50</button>
+      <button class="btn small" onclick="loadAuditRecent(100)">100</button>
+    </div>
+    <table>
+      <thead><tr><th>时间</th><th>模型</th><th>结果</th><th>Input</th><th>Output</th><th>Cached</th><th>Reasoning</th><th>成本</th></tr></thead>
+      <tbody id="auditRecentRows" class="recent"></tbody>
+    </table>
+  </div>
 </div>
 
 <script>
-async function fetchJSON(url){ const r = await fetch(url); return r.json(); }
+async function fetchJSON(url, opts){ const r = await fetch(url, opts); return r.json(); }
 
 function esc(s){ return String(s??"").replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 function shortId(id){ return id ? id.slice(0,12) + "…" : ""; }
@@ -111,6 +229,23 @@ function fmtInt(n){ if(n==null) return "0"; return Number(n).toLocaleString("en-
 function fmtCost(n){ if(n==null) return "$0.0000"; return "$" + Number(n).toFixed(4); }
 function fmtTokens(n){ n = Number(n)||0; if(n>=1e9) return (n/1e9).toFixed(2)+"B"; if(n>=1e6) return (n/1e6).toFixed(2)+"M"; if(n>=1e3) return (n/1e3).toFixed(1)+"K"; return String(n); }
 
+function switchPage(name){
+  document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.page === name));
+  document.querySelectorAll(".page").forEach(p => p.classList.toggle("active", p.id === "page-" + name));
+  if (name === "models") loadModels();
+  if (name === "settings") { loadConfig(); loadAuditRecent(50); }
+}
+
+let toastTimer = null;
+function toast(msg, kind){
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.className = "toast show " + (kind || "");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.className = "toast", 4000);
+}
+
+// ==================== 概览 ====================
 async function renderHealth(){
   const h = await fetchJSON("/api/health");
   const cards = document.getElementById("healthCards");
@@ -269,6 +404,195 @@ function refreshGatewayStats(){
     renderTokenBars(gs);
     renderModelRank(gs);
   });
+}
+
+// ==================== 模型页 ====================
+let modelCache = { list: [], enabled: new Set() };
+
+async function loadModels(){
+  const status = document.getElementById("modelStatus");
+  status.textContent = "正在从网关实时获取模型列表…";
+  const r = await fetchJSON("/api/models");
+  if (!r.ok) {
+    status.innerHTML = `<span class="status-bad">获取失败：${esc(r.error || ("HTTP " + r.status))}</span>`;
+    return;
+  }
+  modelCache.list = r.models || [];
+  // Load current opencode config to pre-check enabled models.
+  const target = document.getElementById("modelTarget").value;
+  const cfg = await fetchJSON("/api/config?target=" + target);
+  const enabled = new Set();
+  if (cfg.ok) {
+    const models = cfg.config?.provider?.zen2api?.models || {};
+    Object.keys(models).forEach(m => enabled.add(m));
+  }
+  modelCache.enabled = enabled;
+  document.getElementById("modelStatus").textContent = `已实时获取 ${modelCache.list.length} 个模型（${new Date(r.fetched).toLocaleTimeString()}）。勾选模型并点“保存模型选择”写入 ${cfg.label || target}。`;
+  renderModelList();
+}
+
+function renderModelList(){
+  const filter = (document.getElementById("modelFilter").value || "").toLowerCase();
+  const list = document.getElementById("modelList");
+  const matched = modelCache.list.filter(m => !filter || m.toLowerCase().includes(filter));
+  if (!modelCache.list.length) {
+    list.innerHTML = `<div class="note" style="padding:14px;">列表为空，点击“刷新列表”获取。</div>`;
+    document.getElementById("modelCount").textContent = "";
+    return;
+  }
+  list.innerHTML = matched.map(m => `
+    <div class="model-row">
+      <input type="checkbox" ${modelCache.enabled.has(m) ? "checked" : ""} onchange="toggleModel('${esc(m).replace(/'/g, "&#39;")}')">
+      <span class="mname" title="${esc(m)}">${esc(m)}</span>
+      <span class="mtag ${modelCache.enabled.has(m) ? "" : "off"}">${modelCache.enabled.has(m) ? "已启用" : "未启用"}</span>
+    </div>`).join("");
+  document.getElementById("modelCount").textContent = `共 ${modelCache.list.length} 个模型，筛选后显示 ${matched.length} 个。`;
+}
+
+function toggleModel(name){
+  if (modelCache.enabled.has(name)) modelCache.enabled.delete(name);
+  else modelCache.enabled.add(name);
+  renderModelList();
+}
+
+async function saveModels(){
+  const target = document.getElementById("modelTarget").value;
+  const status = document.getElementById("modelStatus");
+  const cfg = await fetchJSON("/api/config?target=" + target);
+  if (!cfg.ok) {
+    status.innerHTML = `<span class="status-bad">无法读取目标配置（${esc(cfg.error)}），请先在“设置”页检查。</span>`;
+    return;
+  }
+  const config = cfg.config;
+  if (!config.provider) config.provider = {};
+  if (!config.provider.zen2api) {
+    config.provider.zen2api = { "npm": "@ai-sdk/openai-compatible", "name": "Zen Local (opencode2api)", "options": { "baseURL": "http://127.0.0.1:8080/v1", "apiKey": "" }, "models": {} };
+  }
+  const models = {};
+  for (const name of modelCache.enabled) {
+    models[name] = { name: name.split("-")[0].replace(/^./, c => c.toUpperCase()) + " Free", "variant": "max" };
+  }
+  config.provider.zen2api.models = models;
+  // Set default model to the first enabled one if current default is not enabled.
+  if (config.model && !models[config.model.replace(/^zen2api\//, "")]) {
+    delete config.model;
+  }
+  if (!config.model && modelCache.enabled.size) {
+    config.model = "zen2api/" + [...modelCache.enabled][0];
+  }
+  const body = JSON.stringify(config);
+  const r = await fetchJSON("/api/config?target=" + target + "&save=1", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body,
+  });
+  if (r.ok) {
+    status.innerHTML = `<span class="status-ok">已保存到 ${esc(r.path)}，启用 ${modelCache.enabled.size} 个模型${r.restarted ? "，网关已自动重启" : ""}。默认模型：${esc(config.model || "未设置")}</span>`;
+    toast("模型配置已保存", "ok");
+  } else {
+    status.innerHTML = `<span class="status-bad">保存失败：${esc(r.error)} ${esc(r.detail || "")}</span>`;
+  }
+}
+
+// ==================== 设置页 ====================
+async function loadConfig(){
+  const target = document.getElementById("configTarget").value;
+  const r = await fetchJSON("/api/config?target=" + target);
+  document.getElementById("configPath").textContent = r.ok ? `路径：${r.path}（${r.label}）` : `无法读取（${r.error}）${r.path ? "：" + r.path : ""}`;
+  if (r.ok) {
+    document.getElementById("configEditor").value = JSON.stringify(r.config, null, 2);
+  } else {
+    document.getElementById("configEditor").value = "";
+  }
+}
+
+async function saveConfig(){
+  const target = document.getElementById("configTarget").value;
+  const editor = document.getElementById("configEditor");
+  let json;
+  try {
+    json = JSON.parse(editor.value);
+  } catch (e) {
+    toast("配置不是合法 JSON：" + e.message, "err");
+    return;
+  }
+  // Models page edits opencode configs too; re-validate before saving.
+  const r = await fetchJSON("/api/config?target=" + target, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(json),
+  });
+  if (r.ok) {
+    toast("已保存" + (r.restarted ? "，网关已重启" : "") + (r.backup ? "（备份: " + r.backup.split(/[\\/]/).pop() + "）" : ""), "ok");
+    loadConfig();
+  } else {
+    toast("保存失败：" + (r.error || "") + " " + (r.detail || ""), "err");
+  }
+}
+
+function downloadConfig(){
+  const target = document.getElementById("configTarget").value;
+  const r = readTargetLocal();
+  if (!r) return;
+  const blob = new Blob([JSON.stringify(r, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "config-" + target + ".json";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function readTargetLocal(){
+  try {
+    return JSON.parse(document.getElementById("configEditor").value);
+  } catch {
+    toast("当前配置不是合法 JSON，无法下载", "err");
+    return null;
+  }
+}
+
+async function restartGateway(){
+  if (!confirm("确定要重启网关吗？重启期间请求会短暂中断。")) return;
+  toast("正在重启网关…");
+  const r = await fetchJSON("/api/restart", { method: "POST" });
+  if (r.ok) toast("网关重启完成：" + (r.detail || ""), "ok");
+  else toast("重启失败：" + (r.error || r.detail || ""), "err");
+  setTimeout(renderHealth, 3000);
+}
+
+async function testKey(){
+  const key = document.getElementById("testKeyInput").value.trim();
+  if (!key) { toast("请输入要测试的 key", "err"); return; }
+  const r = await fetchJSON("/api/test-key", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ key }),
+  });
+  const el = document.getElementById("testKeyResult");
+  if (r.ok && r.status === 200) {
+    el.innerHTML = `<span class="status-ok">有效（HTTP 200）</span>`;
+  } else {
+    el.innerHTML = `<span class="status-bad">无效：HTTP ${r.status || 0} ${esc(r.detail || "")}</span>`;
+  }
+}
+
+async function loadAuditRecent(limit){
+  const r = await fetchJSON("/api/audit-recent?limit=" + limit);
+  document.getElementById("auditRecentNote").textContent = `共 ${fmtInt(r.total_lines)} 条记录，显示最近 ${r.entries.length} 条：`;
+  const rows = document.getElementById("auditRecentRows");
+  rows.innerHTML = r.entries.map(e => {
+    const u = e.usage || {};
+    return `<tr>
+      <td>${esc((e.ts || "").replace("T", " ").slice(5, 19))}</td>
+      <td>${esc(e.model || "")}</td>
+      <td>${e.ok ? '<span class="pill ok">成功</span>' : '<span class="pill err">失败</span>'}</td>
+      <td>${fmtTokens(u.Input)}</td>
+      <td>${fmtTokens(u.Output)}</td>
+      <td>${fmtTokens(u.Cached)}</td>
+      <td>${fmtTokens(u.Reasoning)}</td>
+      <td>${fmtCost(e.cost)}</td>
+    </tr>`;
+  }).join("") || `<tr><td colspan="8" class="note">暂无记录</td></tr>`;
 }
 
 renderHealth();
