@@ -1,23 +1,30 @@
 package main
 
-// sanitizeOpenAIBody removes request fields that the upstream
-// OpenAI-compatible endpoint (e.g. Gemini at
-// generativelanguage.googleapis.com/v1beta/openai) rejects with an opaque 400
-// "Bad Request". Keeping the body clean prevents the gateway from forwarding
-// fields that would otherwise surface to the client as
-// "upstream_error: Bad Request".
-//
-// The function only removes keys; it never injects new fields, because Gemini
-// also rejects explicit null values (e.g. "frequency_penalty": null) with the
-// same 400.
+// geminiUnsupportedParams lists OpenAI chat-completion request fields that
+// Gemini's OpenAI-compatible endpoint (generativelanguage.googleapis.com/
+// v1beta/openai) rejects with an opaque 400 "Bad Request". The gateway strips
+// them so clients (e.g. the opencode ai-sdk) can send a full OpenAI-shaped
+// request without tripping upstream validation.
+var geminiUnsupportedParams = []string{
+	"logprobs",
+	"top_logprobs",
+	"logit_bias",
+	"seed",
+	"echo",
+	"best_of",
+	"frequency_penalty",
+	"presence_penalty",
+	"repetition_penalty",
+}
+
+// sanitizeOpenAIBody removes request fields the upstream OpenAI-compatible
+// endpoint rejects. It only deletes or normalizes keys the client actually
+// sent — it never injects new fields, because Gemini also rejects explicit
+// null values with the same 400.
 func sanitizeOpenAIBody(payload map[string]any) map[string]any {
-	// Gemini's OpenAI-compatible API has no logprobs support.
-	delete(payload, "logprobs")
-	delete(payload, "top_logprobs")
-	// Gemini rejects the frequency / presence penalty parameters entirely,
-	// even with valid in-range values.
-	delete(payload, "frequency_penalty")
-	delete(payload, "presence_penalty")
+	for _, key := range geminiUnsupportedParams {
+		delete(payload, key)
+	}
 
 	// Gemini only supports a single completion (n=1).
 	if n, ok := payload["n"]; ok {
@@ -25,6 +32,18 @@ func sanitizeOpenAIBody(payload map[string]any) map[string]any {
 			payload["n"] = 1
 		} else if i, ok := n.(int); ok && i > 1 {
 			payload["n"] = 1
+		}
+	}
+
+	// Gemini caps top_p at 1.0; clamp instead of dropping so valid values pass.
+	if v, ok := payload["top_p"]; ok {
+		if f, ok := toFloat(v); ok {
+			switch {
+			case f < 0:
+				payload["top_p"] = 0.0
+			case f > 1:
+				payload["top_p"] = 1.0
+			}
 		}
 	}
 	return payload

@@ -4,44 +4,42 @@ import (
 	"testing"
 )
 
-// TestSanitizeOpenAIBodyStripsUnsupportedFields verifies that fields Gemini's
-// OpenAI-compatible endpoint rejects are removed or normalized before the
-// request is forwarded upstream (these otherwise surface as opaque
-// "upstream_error: Bad Request" 400s).
+// TestSanitizeOpenAIBodyStripsUnsupportedFields verifies that every field
+// Gemini's OpenAI-compatible endpoint rejects is removed (or normalized) before
+// the request is forwarded, so the client never sees an opaque
+// "upstream_error: Bad Request" 400.
 func TestSanitizeOpenAIBodyStripsUnsupportedFields(t *testing.T) {
 	in := map[string]any{
-		"model":             "gemini-3.7-flash",
-		"messages":          []any{map[string]any{"role": "user", "content": "hi"}},
-		"logprobs":          true,
-		"top_logprobs":      5,
-		"n":                 2,
-		"frequency_penalty": 3.0,
-		"presence_penalty":  -5.0,
-		"temperature":       5.0,
+		"model":              "gemini-3.7-flash",
+		"messages":           []any{map[string]any{"role": "user", "content": "hi"}},
+		"logprobs":           true,
+		"top_logprobs":       5,
+		"logit_bias":         map[string]any{"123": 5},
+		"seed":               42,
+		"echo":               true,
+		"best_of":            2,
+		"frequency_penalty":  3.0,
+		"presence_penalty":   -5.0,
+		"repetition_penalty": 1.1,
+		"n":                  2,
+		"top_p":              2.5,
 	}
 
 	out := sanitizeOpenAIBody(in)
 
-	if _, ok := out["logprobs"]; ok {
-		t.Error("logprobs must be stripped (Gemini rejects it)")
-	}
-	if _, ok := out["top_logprobs"]; ok {
-		t.Error("top_logprobs must be stripped (Gemini rejects it)")
-	}
-	if _, ok := out["frequency_penalty"]; ok {
-		t.Error("frequency_penalty must be stripped (Gemini rejects the param)")
-	}
-	if _, ok := out["presence_penalty"]; ok {
-		t.Error("presence_penalty must be stripped (Gemini rejects the param)")
+	for _, key := range geminiUnsupportedParams {
+		if _, ok := out[key]; ok {
+			t.Errorf("%s must be stripped (Gemini rejects it)", key)
+		}
 	}
 	if n, ok := out["n"].(int); !ok || n != 1 {
 		t.Errorf("n>1 must be forced to 1, got %v", out["n"])
 	}
+	if tp, ok := out["top_p"].(float64); !ok || tp != 1.0 {
+		t.Errorf("top_p 2.5 must be clamped to 1.0, got %v", out["top_p"])
+	}
 	if _, ok := out["messages"]; !ok {
 		t.Error("legitimate fields like messages must be preserved")
-	}
-	if tp, ok := toFloat(out["temperature"]); !ok || tp != 5.0 {
-		t.Errorf("temperature must be preserved (Gemini accepts it), got %v", out["temperature"])
 	}
 }
 
@@ -54,6 +52,7 @@ func TestSanitizeOpenAIBodyPreservesValidRequest(t *testing.T) {
 		"temperature": 0.7,
 		"top_p":       0.9,
 		"max_tokens":  1024,
+		"stream":      true,
 	}
 	out := sanitizeOpenAIBody(in)
 
@@ -65,5 +64,8 @@ func TestSanitizeOpenAIBodyPreservesValidRequest(t *testing.T) {
 	}
 	if f, ok := toFloat(out["max_tokens"]); !ok || f != 1024 {
 		t.Errorf("max_tokens must be preserved, got %v", out["max_tokens"])
+	}
+	if _, ok := out["stream"]; !ok {
+		t.Error("stream must be preserved")
 	}
 }
