@@ -290,6 +290,9 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 		if route.Tier == TierGo {
 			upstreamURL = g.cfg.Upstream.Go
 		}
+		if g.cfg.UpstreamMode.isOpenAI() {
+			sanitizeOpenAIBody(payload)
+		}
 		upstreamPayload, err := prepareUpstreamRequest(external, route.Protocol, payload, upstreamURL)
 		if err != nil {
 			writeAPIError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
