@@ -165,6 +165,22 @@ Telegram 用法：URL 追加 `?chat_id=xxx&text={message}`（`{message}` 会被�
 | `shared_429_threshold` | 窗口内多少个不同 key 出现 429 即判定账号级共享限流 |
 | `max_wait_seconds` | 请求背压等待上限（秒），超时返回 503 + `Retry-After` |
 
+### 4.6 双上游池（v3.2）
+
+`upstream_mode: "openai"` 时网关支持**同时接入两个 OpenAI 兼容上游**，按模型名路由：
+
+- **主上游（zen 层）**：`upstream.zen` + `zen_keys`，模型目录来自 `models.static`（如 Google AI Studio / Gemini）。
+- **第二上游（go 层）**：`upstream.go` + `go_keys`，模型目录来自 `models.static_go`（任意 OpenAI 兼容中继/服务）。
+- 两层各自拥有独立的 key 池、冷却、限流、配额停用与 Prometheus 指标（`tier="zen"|"go"`）；一个上游被打爆时另一个继续服务。
+- `models.protocols` 可强制某模型走指定上游协议（如把 `claude-*` 强制为 `chat`，避免 `/messages` 路径）。
+
+```json
+"upstream": { "zen": "https://generativelanguage.googleapis.com/v1beta/openai", "go": "https://your-relay.example" },
+"models":   { "static": ["gemini-..."], "static_go": ["relay-model-a", "relay-model-b"] }
+```
+
+> 注意：`static_go` 里的模型名需与第二上游实际暴露的一致；两层模型名不要重复。
+
 ### 5. 终端 CLI `oc-stats.mjs`（零依赖）
 
 不开浏览器也能看用量：

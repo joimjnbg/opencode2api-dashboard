@@ -10,23 +10,23 @@ import (
 )
 
 type Config struct {
-	Listen      string            `json:"listen"`
-	ServerKeys  []string          `json:"server_keys"`
-	ZenKeys     []string          `json:"zen_keys"`
-	GoKeys      []string          `json:"go_keys"`
-	Proxies     []string          `json:"proxies"`
-	Upstream    UpstreamConfig    `json:"upstream"`
-	UpstreamMode UpstreamMode     `json:"upstream_mode"`
-	Retry       RetryConfig       `json:"retry"`
-	Models      ModelsConfig      `json:"models"`
-	Performance PerformanceConfig `json:"performance"`
-	Logging     LoggingConfig     `json:"logging"`
-	Stats       StatsConfig       `json:"stats"`
-	Prefer      Tier              `json:"prefer"`
-	Sanitize    SanitizeConfig    `json:"sanitize"`
-	Failover    FailoverConfig    `json:"failover"`
-	Fingerprint FingerprintConfig `json:"fingerprint"`
-	RateLimit   RateLimitConfig   `json:"rate_limit"`
+	Listen       string            `json:"listen"`
+	ServerKeys   []string          `json:"server_keys"`
+	ZenKeys      []string          `json:"zen_keys"`
+	GoKeys       []string          `json:"go_keys"`
+	Proxies      []string          `json:"proxies"`
+	Upstream     UpstreamConfig    `json:"upstream"`
+	UpstreamMode UpstreamMode      `json:"upstream_mode"`
+	Retry        RetryConfig       `json:"retry"`
+	Models       ModelsConfig      `json:"models"`
+	Performance  PerformanceConfig `json:"performance"`
+	Logging      LoggingConfig     `json:"logging"`
+	Stats        StatsConfig       `json:"stats"`
+	Prefer       Tier              `json:"prefer"`
+	Sanitize     SanitizeConfig    `json:"sanitize"`
+	Failover     FailoverConfig    `json:"failover"`
+	Fingerprint  FingerprintConfig `json:"fingerprint"`
+	RateLimit    RateLimitConfig   `json:"rate_limit"`
 }
 
 type UpstreamConfig struct {
@@ -64,6 +64,10 @@ type ModelsConfig struct {
 	// from the upstream. Required for ModeOpenAI upstreams whose /models
 	// endpoint is not OpenAI-compatible (e.g. Google AI Studio).
 	Static []string `json:"static"`
+	// StaticGo is the static catalog for the second upstream (the "go" tier,
+	// e.g. an OpenAI/Anthropic relay). Models listed here route to
+	// upstream.go with go_keys, keeping failover and metrics per upstream.
+	StaticGo []string `json:"static_go"`
 }
 
 type LoggingConfig struct {
@@ -148,16 +152,16 @@ func LoadConfig(path string) (Config, error) {
 		return Config{}, fmt.Errorf("read %s: %w", path, err)
 	}
 	cfg := Config{
-		Listen:      "127.0.0.1:8080",
-		Proxies:     []string{"direct"},
-		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/zen", Go: "https://opencode.ai/zen/go"},
+		Listen:       "127.0.0.1:8080",
+		Proxies:      []string{"direct"},
+		Upstream:     UpstreamConfig{Zen: "https://opencode.ai/zen", Go: "https://opencode.ai/zen/go"},
 		UpstreamMode: ModeOpenCode,
-		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300},
-		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
-		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15},
-		Logging:     LoggingConfig{Level: "info"},
-		Stats:       StatsConfig{},
-		Prefer:      TierGo,
+		Retry:        RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300},
+		Models:       ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
+		Performance:  PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15},
+		Logging:      LoggingConfig{Level: "info"},
+		Stats:        StatsConfig{},
+		Prefer:       TierGo,
 		Sanitize: SanitizeConfig{
 			Enabled:         true,
 			StripFreeSuffix: false,

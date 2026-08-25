@@ -795,12 +795,13 @@ func protocolPath(protocol Protocol, mode UpstreamMode) string {
 
 func (g *Gateway) StartModelRefresh(ctx context.Context) {
 	refresh := func() {
-		if g.cfg.UpstreamMode.isOpenAI() && len(g.cfg.Models.Static) > 0 {
-			// OpenAI-compatible upstreams (Gemini) may not expose an
-			// OpenAI-shaped /models endpoint, so the catalog is taken from the
-			// configured static list.
-			g.catalog.Replace(g.cfg.Models.Static, nil)
-			g.logger.Info("model catalog loaded from static list", "models", len(g.cfg.Models.Static))
+		if g.cfg.UpstreamMode.isOpenAI() && (len(g.cfg.Models.Static) > 0 || len(g.cfg.Models.StaticGo) > 0) {
+			// OpenAI-compatible upstreams may not expose an OpenAI-shaped
+			// /models endpoint, so the catalog is taken from the configured
+			// static lists: Static routes to the primary upstream (zen tier),
+			// StaticGo to the second upstream (go tier).
+			g.catalog.Replace(g.cfg.Models.Static, g.cfg.Models.StaticGo)
+			g.logger.Info("model catalog loaded from static list", "models", len(g.cfg.Models.Static)+len(g.cfg.Models.StaticGo))
 			return
 		}
 		var zen, goModels []string
