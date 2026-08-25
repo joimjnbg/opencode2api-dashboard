@@ -31,6 +31,10 @@ type fakeUpstream struct {
 	// ("Rate limit exceeded", NOT a quota body) and everything afterwards
 	// succeed. Used to exercise the account-throttle path.
 	rateLimitFirst atomic.Int32
+	// serverErrorFirst makes the first N observed requests return 504 and
+	// everything afterwards succeed. Used to exercise transient-upstream
+	// retry behavior.
+	serverErrorFirst atomic.Int32
 }
 
 func newFakeUpstream(answers map[string]int) *fakeUpstream {
@@ -85,6 +89,18 @@ func (f *fakeUpstream) handler() http.Handler {
 				f.seenKeys.Add(1)
 				w.WriteHeader(429)
 				_, _ = w.Write([]byte(`{"error":{"message":"Rate limit exceeded. Please try again later.","type":"FreeUsageLimitError"}}`))
+				return
+			}
+		}
+		for {
+			left := f.serverErrorFirst.Load()
+			if left <= 0 {
+				break
+			}
+			if f.serverErrorFirst.CompareAndSwap(left, left-1) {
+				f.seenKeys.Add(1)
+				w.WriteHeader(http.StatusGatewayTimeout)
+				_, _ = w.Write([]byte(`{"error":{"message":"upstream timeout"}}`))
 				return
 			}
 		}
@@ -305,6 +321,56 @@ func TestShared429BeyondWaitReturnsThrottleError(t *testing.T) {
 	}
 	if gw.zenNodes.ThrottleDeadline().IsZero() {
 		t.Error("account throttle must remain active")
+	}
+}
+
+// TestUpstream5xxRetriesThenSucceeds verifies that a transient upstream
+// failure (504) on a full pass through the pool is retried (after key
+// cooldowns elapse) instead of surfacing to the client — critical for
+// single-key tiers where there is no next key to fail over to.
+func TestUpstream5xxRetriesThenSucceeds(t *testing.T) {
+	gw, upstream := testGateway(t, map[string]int{}, true)
+	upstream.serverErrorFirst.Store(2) // both keys 504 once, then success
+
+	body := []byte(`{"model":"deepseek-v4-flash","messages":[]}`)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	resp, err := gw.doUpstream(ctx, catalogTestRoute(), body, requestIDs{Session: "s", Request: "r", Project: "p"})
+	if err != nil {
+		t.Fatalf("doUpstream: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("transient 504 must be retried to success, got %d", resp.StatusCode)
+	}
+	if seen := upstream.seenKeys.Load(); seen != 3 {
+		t.Errorf("expected 3 upstream attempts (2x504 + 1 success), got %d", seen)
+	}
+}
+
+// TestUpstream5xxGivesUpAfterMaxAttempts bounds the retry loop: when the
+// upstream keeps failing with 504, the gateway gives up and returns the last
+// upstream response after retry.max_attempts passes.
+func TestUpstream5xxGivesUpAfterMaxAttempts(t *testing.T) {
+	gw, upstream := testGateway(t, map[string]int{}, true)
+	upstream.serverErrorFirst.Store(1 << 30) // always 504
+
+	body := []byte(`{"model":"deepseek-v4-flash","messages":[]}`)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	resp, err := gw.doUpstream(ctx, catalogTestRoute(), body, requestIDs{Session: "s", Request: "r", Project: "p"})
+	if err != nil {
+		t.Fatalf("doUpstream: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Errorf("persistent 504 must surface as 504, got %d", resp.StatusCode)
+	}
+	// max_attempts=3 -> 3 full passes over the 2-key pool.
+	if seen := upstream.seenKeys.Load(); seen != 6 {
+		t.Errorf("expected 6 upstream attempts (3 passes x 2 keys), got %d", seen)
 	}
 }
 

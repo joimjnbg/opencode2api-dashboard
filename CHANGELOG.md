@@ -6,6 +6,7 @@
 
 ### 新增
 
+- **瞬时上游故障整池重试**：一轮 key 池全部失败且属瞬态错误（上游 502/503/504 或传输错误）时，自动等待 key 冷却到期后重试整池（受 `retry.max_attempts` 与请求超时双重约束），4xx 请求形状错误不重试。对单 key 层（无下一个 key 可切换）尤为关键——上游偶发超时不再直接透传给客户端。
 - **双上游池（openai 模式）**：新增 `models.static_go` 静态目录，第二上游（`upstream.go` + `go_keys`）与主上游（`upstream.zen` + `zen_keys` + `models.static`）同时服务：按模型名路由到所属层，两层各自维护独立的 key 池、静默 failover、账号级熔断、配额停用与 Prometheus 指标（`tier="zen"|"go"`）。一个上游限流时另一个继续承担流量；两层模型名不应重复，`prefer` 仅在同名模型时生效。
 - **OpenAI 兼容上游（`upstream_mode: "openai"`）**：支持接入任意 OpenAI 兼容上游（如 Google AI Studio / Gemini，基址 `https://generativelanguage.googleapis.com/v1beta/openai`）。该模式下：不再发送 opencode 客户端头（`x-opencode-*`、`x-machine-id` 等）；放行 `gemini-*` 模型；模型目录改用 `models.static` 静态列表（避免依赖非 OpenAI 形态的 `/models` 端点）；429 仅按单 key 节流而非额度停用；配额识别改用 OpenAI 兼容规则（`rate_limit_exceeded`、配额短语，不含裸 `429`）。原 opencode.ai 行为在 `upstream_mode: "opencode"`（默认）下完全不变。
 - **多账号池（`failover.multi_account`）**：适用于一个池内配置了多个不同 opencode 账号 key 的场景。每个 key 视为独立账号——429 只冷却/限流该账号本身，不再误判整个池为共享账号限流；请求按轮转公平地分摊到各账号（不再把整段对话钉在单一账号上，避免某账号额度先耗尽）。

@@ -413,6 +413,11 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 	var lastResponse *http.Response
 	var lastErr error
 	anyQuota := false
+	attempt := 0
+	maxAttempts := g.cfg.Retry.MaxAttempts
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
 
 requestLoop:
 	for {
@@ -582,6 +587,16 @@ requestLoop:
 				g.logger.Debug("upstream rejected request", "request_id", ids.Request, "status", resp.StatusCode, "proxy", redactURL(proxy.name), "tier", route.Tier)
 			}
 		}
+		// A full pass over the pool failed. Transient upstream failures
+		// (502/503/504, transport errors) justify another pass once key
+		// cooldowns elapse — vital for single-key tiers with no failover
+		// target. The loop head waits out cooldowns; the request context
+		// bounds total time.
+		attempt++
+		if attempt < maxAttempts && transientRetryable(lastResponse, lastErr) {
+			g.logger.Debug("transient upstream failure, retrying pool pass", "request_id", ids.Request, "tier", route.Tier, "attempt", attempt, "max_attempts", maxAttempts)
+			continue requestLoop
+		}
 		break
 	}
 
@@ -601,6 +616,23 @@ requestLoop:
 // answer 503 with a Retry-After header instead of leaving the client guessing.
 type throttleError struct {
 	retryAfter time.Duration
+}
+
+// transientRetryable reports whether a failed pool pass is worth retrying:
+// transport errors and upstream 502/503/504 are treated as transient; request
+// shape errors (4xx) and quota/limit paths are not (they have their own flows).
+func transientRetryable(resp *http.Response, err error) bool {
+	if err != nil {
+		return true
+	}
+	if resp == nil {
+		return false
+	}
+	switch resp.StatusCode {
+	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false
 }
 
 func (e *throttleError) Error() string {
