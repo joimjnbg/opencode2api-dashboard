@@ -181,6 +181,8 @@ Telegram 用法：URL 追加 `?chat_id=xxx&text={message}`（`{message}` 会被�
 
 > 注意：`static_go` 里的模型名需与第二上游实际暴露的一致；两层模型名不要重复。
 
+**跨层自动回退**：`failover.cross_tier_fallback_model` 填入第二上游的某个模型名（如 `"big-pickle"`）后，当主上游（zen 层，如 Google AI Studio——只有每日限额）的**全部 key 配额耗尽/冷却/节流**时，网关自动把请求改写到该模型并由 go 层（lfree 中继）服务，客户端无感、用量统计仍记在原模型名下。留空禁用。配合 Google 层建议调小 `performance.failure_cooldown_seconds` 与 `failover.throttle.*`，避免分钟级偶发 429 触发不必要的长冷却。
+
 ### 5. 终端 CLI `oc-stats.mjs`（零依赖）
 
 不开浏览器也能看用量：

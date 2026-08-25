@@ -286,28 +286,14 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			payload["model"] = routedModel
 			model = routedModel
 		}
-		upstreamURL := g.cfg.Upstream.Zen
-		if route.Tier == TierGo {
-			upstreamURL = g.cfg.Upstream.Go
-		}
 		if g.cfg.UpstreamMode.isOpenAI() {
 			sanitizeOpenAIBody(payload)
-		}
-		upstreamPayload, err := prepareUpstreamRequest(external, route.Protocol, payload, upstreamURL)
-		if err != nil {
-			writeAPIError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
-			return
-		}
-		encoded, err := json.Marshal(upstreamPayload)
-		if err != nil {
-			writeAPIError(w, external, http.StatusBadRequest, "request contains unsupported JSON values", "invalid_request_error", "")
-			return
 		}
 		ids := deriveRequestIDs(r, payload)
 		stream := boolAt(payload, "stream")
 		requestCtx, cancel := context.WithTimeout(r.Context(), time.Duration(g.cfg.Retry.TimeoutSeconds)*time.Second)
 		defer cancel()
-		resp, err := g.doUpstream(requestCtx, route, encoded, ids)
+		resp, err := g.doUpstreamWithFallback(requestCtx, route, external, payload, ids)
 		if err != nil {
 			var te *throttleError
 			switch {
@@ -377,6 +363,55 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(responseBody)
 	}
+}
+
+// doUpstreamWithFallback prepares and sends the request to the model's own
+// tier, then — when the primary (zen) tier is exhausted (all keys
+// quota-parked/cooled, the pool throttled, or nothing cooling-free left) and a
+// fallback model is configured — retries the same request once against the
+// second upstream (go tier) under the configured substitute model name. The
+// client keeps speaking its original model; usage stats stay on that name.
+func (g *Gateway) doUpstreamWithFallback(ctx context.Context, route modelRoute, external Protocol, payload map[string]any, ids requestIDs) (*http.Response, error) {
+	baseURL := g.cfg.Upstream.Zen
+	if route.Tier == TierGo {
+		baseURL = g.cfg.Upstream.Go
+	}
+	prepared, err := prepareUpstreamRequest(external, route.Protocol, payload, baseURL)
+	if err != nil {
+		return nil, err
+	}
+	encoded, err := json.Marshal(prepared)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := g.doUpstream(ctx, route, encoded, ids)
+	if err == nil || route.Tier != TierZen || g.cfg.Failover.CrossTierFallbackModel == "" || len(g.cfg.GoKeys) == 0 {
+		return resp, err
+	}
+	var te *throttleError
+	if !(errors.As(err, &te) || errors.Is(err, errQuotaExhausted) || errors.Is(err, errAllCooling)) {
+		return resp, err
+	}
+
+	fallbackModel := g.cfg.Failover.CrossTierFallbackModel
+	g.logger.Warn("primary tier exhausted, failing over to second upstream", "request_id", ids.Request, "from_model", stringAt(payload, "model"), "to_model", fallbackModel, "reason", err.Error())
+	altRoute := modelRoute{ID: fallbackModel, Tier: TierGo, Protocol: ProtocolChat}
+	payload["model"] = fallbackModel
+	altPrepared, perr := prepareUpstreamRequest(external, altRoute.Protocol, payload, g.cfg.Upstream.Go)
+	if perr != nil {
+		return resp, err
+	}
+	altEncoded, merr := json.Marshal(altPrepared)
+	if merr != nil {
+		return resp, err
+	}
+	altResp, aerr := g.doUpstream(ctx, altRoute, altEncoded, ids)
+	if aerr != nil {
+		// Both tiers are out: surface the original primary-tier error so the
+		// client gets the more meaningful rate-limit signal.
+		return resp, err
+	}
+	return altResp, nil
 }
 
 func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte, ids requestIDs) (*http.Response, error) {

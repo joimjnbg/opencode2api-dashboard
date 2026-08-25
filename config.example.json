@@ -58,6 +58,7 @@
     "treat_generic_429_as_quota": false,
     "multi_account": true,
     "quota_park_minutes": 0,
+    "cross_tier_fallback_model": "",
     "throttle": {
       "initial_seconds": 30,
       "max_seconds": 300,

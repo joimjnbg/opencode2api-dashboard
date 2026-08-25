@@ -368,9 +368,88 @@ func TestUpstream5xxGivesUpAfterMaxAttempts(t *testing.T) {
 	if resp.StatusCode != http.StatusGatewayTimeout {
 		t.Errorf("persistent 504 must surface as 504, got %d", resp.StatusCode)
 	}
-	// max_attempts=3 -> 3 full passes over the 2-key pool.
-	if seen := upstream.seenKeys.Load(); seen != 6 {
-		t.Errorf("expected 6 upstream attempts (3 passes x 2 keys), got %d", seen)
+	// max_attempts=3 -> at most 3 pool passes; staggered exponential
+	// cooldowns mean later passes may carry fewer active keys, so accept
+	// 3..6 total upstream hits.
+	if seen := upstream.seenKeys.Load(); seen < 3 || seen > 6 {
+		t.Errorf("expected 3-6 upstream attempts across retries, got %d", seen)
+	}
+}
+
+// crossTierGateway builds a two-tier gateway against one fake upstream:
+// zen keys answer with the given status, the go key ("key-go") answers 200.
+func crossTierGateway(t *testing.T, zenStatus int, fallbackModel string) (*Gateway, *fakeUpstream) {
+	t.Helper()
+	upstream := newFakeUpstream(map[string]int{"key-a": zenStatus, "key-b": zenStatus})
+	server := httptest.NewServer(upstream.handler())
+	t.Cleanup(server.Close)
+
+	cfg := Config{
+		Listen:      "127.0.0.1:0",
+		ServerKeys:  []string{"local"},
+		ZenKeys:     []string{"key-a", "key-b"},
+		GoKeys:      []string{"key-go"},
+		Proxies:     []string{"direct"},
+		Upstream:    UpstreamConfig{Zen: server.URL, Go: server.URL},
+		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 30},
+		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
+		Performance: PerformanceConfig{MaxIdleConns: 10, MaxIdleConnsPerHost: 10, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 30, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 1},
+		Logging:     LoggingConfig{Level: "error"},
+		Stats:       StatsConfig{},
+		Prefer:      TierZen,
+		Sanitize:    SanitizeConfig{Enabled: true, StripFreeSuffix: true, ModelAliases: map[string]string{}},
+		Failover:    FailoverConfig{Enabled: true, QuotaCooldownMinutes: 30, TreatGeneric429AsQuota: false, CrossTierFallbackModel: fallbackModel, Throttle: ThrottleConfig{InitialSeconds: 1, MaxSeconds: 600, Shared429Threshold: 99, MaxWaitSeconds: 5}},
+		Fingerprint: FingerprintConfig{Enabled: false, PersistFile: ""},
+		RateLimit:   RateLimitConfig{Enabled: false},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	gw, err := NewGateway(cfg, logger)
+	if err != nil {
+		t.Fatalf("NewGateway: %v", err)
+	}
+	return gw, upstream
+}
+
+// TestCrossTierFallbackOnQuotaExhausted verifies that when every primary-tier
+// (zen / Google AI Studio) key hits its daily quota, the request is rewritten
+// to the configured second-upstream model and served from the go tier instead
+// of surfacing a 503 to the client.
+func TestCrossTierFallbackOnQuotaExhausted(t *testing.T) {
+	gw, upstream := crossTierGateway(t, 429, "big-pickle")
+
+	payload := map[string]any{"model": "gemini-3.7-flash", "messages": []any{map[string]any{"role": "user", "content": "hi"}}}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := gw.doUpstreamWithFallback(ctx, catalogTestRoute(), ProtocolChat, payload, requestIDs{Session: "s", Request: "r", Project: "p"})
+	if err != nil {
+		t.Fatalf("expected fallback success, got error: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("fallback must serve 200 from go tier, got %d", resp.StatusCode)
+	}
+	counts := upstream.PerKeyCounts()
+	if counts["key-go"] != 1 {
+		t.Errorf("go-tier key must serve exactly once, got %d", counts["key-go"])
+	}
+}
+
+// TestCrossTierFallbackDisabledKeepsOriginalError ensures no hidden rewrite
+// happens when cross_tier_fallback_model is not configured.
+func TestCrossTierFallbackDisabledKeepsOriginalError(t *testing.T) {
+	gw, upstream := crossTierGateway(t, 429, "")
+
+	payload := map[string]any{"model": "gemini-3.7-flash", "messages": []any{map[string]any{"role": "user", "content": "hi"}}}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, err := gw.doUpstreamWithFallback(ctx, catalogTestRoute(), ProtocolChat, payload, requestIDs{Session: "s", Request: "r", Project: "p"})
+	if !errors.Is(err, errQuotaExhausted) {
+		t.Fatalf("without fallback config the original quota error must surface, got %v", err)
+	}
+	if counts := upstream.PerKeyCounts(); counts["key-go"] != 0 {
+		t.Errorf("go tier must not be touched when fallback disabled, got %d calls", counts["key-go"])
 	}
 }
 

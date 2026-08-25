@@ -122,6 +122,12 @@ type FailoverConfig struct {
 	// remainder of the free-tier quota window instead of the short cooldown.
 	// Zero disables parking and keeps the existing quota cooldown behaviour.
 	QuotaParkMinutes int `json:"quota_park_minutes"`
+	// CrossTierFallbackModel names a model on the second upstream (go tier)
+	// that serves requests when the primary tier is exhausted: every zen key
+	// quota-parked/cooled, the pool throttled, or all keys cooling. Empty
+	// disables the fallback. Intended for daily-limited primaries (Google AI
+	// Studio) backed by a relay second upstream.
+	CrossTierFallbackModel string `json:"cross_tier_fallback_model"`
 }
 
 // ThrottleConfig tunes the account-level rate-limit circuit breaker.
