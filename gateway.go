@@ -350,6 +350,13 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			writeAPIError(w, external, http.StatusBadGateway, "failed to read upstream response", "upstream_error", ids.Request)
 			return
 		}
+		if resp.StatusCode >= 400 {
+			msg := string(responseBody)
+			if len(msg) > 600 {
+				msg = msg[:600]
+			}
+			g.logger.Warn("upstream returned error status", "request_id", ids.Request, "tier", route.Tier, "model", payload["model"], "status", resp.StatusCode, "body", msg)
+		}
 		g.stats.Record(model, usageFromResponse(route.Protocol, responseBody), costFromResponse(responseBody), true)
 		if external != route.Protocol {
 			responseBody, err = convertResponse(route.Protocol, external, responseBody)
