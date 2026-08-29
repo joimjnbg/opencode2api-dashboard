@@ -2,9 +2,12 @@ package main
 
 // geminiUnsupportedParams lists OpenAI chat-completion request fields that
 // Gemini's OpenAI-compatible endpoint (generativelanguage.googleapis.com/
-// v1beta/openai) rejects with an opaque 400 "Bad Request". The gateway strips
-// them so clients (e.g. the opencode ai-sdk) can send a full OpenAI-shaped
-// request without tripping upstream validation.
+// v1beta/openai) rejects with an opaque 400 "Bad Request". These fall into two
+// buckets: legacy OpenAI params Gemini never adopted, and Gemini-native
+// GenerateContent params (top_k, stop_sequences, candidate_count, …) that
+// clients targeting Gemini sometimes send but the OpenAI-shaped endpoint does
+// not accept. The gateway strips them so clients (e.g. the opencode ai-sdk) can
+// send a full Gemini-shaped request without tripping upstream validation.
 var geminiUnsupportedParams = []string{
 	"logprobs",
 	"top_logprobs",
@@ -20,6 +23,21 @@ var geminiUnsupportedParams = []string{
 	"metadata",
 	"reasoning_effort",
 	"service_tier",
+	// Gemini-native GenerateContent params rejected by the OpenAI-compatible endpoint.
+	"top_k",
+	"topk",
+	"stop_sequences",
+	"stopsequences",
+	"candidate_count",
+	"candidatecount",
+	"safety_settings",
+	"safetysettings",
+	"response_mime_type",
+	"responsemimetype",
+	"response_schema",
+	"responseschema",
+	"generation_config",
+	"generationconfig",
 }
 
 // sanitizeOpenAIBody removes request fields the upstream OpenAI-compatible
@@ -32,16 +50,19 @@ func sanitizeOpenAIBody(payload map[string]any) map[string]any {
 		delete(payload, key)
 	}
 
-	// Gemini names the output cap "max_tokens"; the newer OpenAI param
-	// "max_completion_tokens" makes Gemini return 400 "Bad Request". Rename
-	// it (only when the client did not also send max_tokens).
-	if _, hasMax := payload["max_tokens"]; !hasMax {
-		if v, ok := payload["max_completion_tokens"]; ok {
-			delete(payload, "max_completion_tokens")
-			payload["max_tokens"] = v
+	// Gemini names the output cap "max_tokens". Both the newer OpenAI param
+	// "max_completion_tokens" and Gemini's own "max_output_tokens" make the
+	// OpenAI-compatible endpoint return 400 "Bad Request". Rename whichever is
+	// present (only when the client did not also send max_tokens).
+	for _, src := range []string{"max_completion_tokens", "max_output_tokens", "maxoutputtokens"} {
+		if _, hasMax := payload["max_tokens"]; !hasMax {
+			if v, ok := payload[src]; ok {
+				delete(payload, src)
+				payload["max_tokens"] = v
+			}
+		} else {
+			delete(payload, src)
 		}
-	} else {
-		delete(payload, "max_completion_tokens")
 	}
 
 	// Gemini only supports a single completion (n=1).

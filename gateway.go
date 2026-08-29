@@ -355,7 +355,15 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			if len(msg) > 600 {
 				msg = msg[:600]
 			}
-			g.logger.Warn("upstream returned error status", "request_id", ids.Request, "tier", route.Tier, "model", payload["model"], "status", resp.StatusCode, "body", msg)
+			if dump, derr := json.Marshal(payload); derr == nil {
+				d := string(dump)
+				if len(d) > 1200 {
+					d = d[:1200]
+				}
+				g.logger.Warn("upstream returned error status", "request_id", ids.Request, "tier", route.Tier, "model", payload["model"], "status", resp.StatusCode, "body", msg, "sent", d)
+			} else {
+				g.logger.Warn("upstream returned error status", "request_id", ids.Request, "tier", route.Tier, "model", payload["model"], "status", resp.StatusCode, "body", msg)
+			}
 		}
 		g.stats.Record(model, usageFromResponse(route.Protocol, responseBody), costFromResponse(responseBody), true)
 		if external != route.Protocol {
@@ -412,7 +420,12 @@ func (g *Gateway) doUpstreamWithFallback(ctx context.Context, route modelRoute, 
 	if merr != nil {
 		return resp, err
 	}
-	altResp, aerr := g.doUpstream(ctx, altRoute, altEncoded, ids)
+	// Use a fresh context for the fallback so the primary tier's backpressure
+	// wait (which can consume most of the request budget) does not cancel the
+	// second-tier request with "context canceled".
+	fbCtx, fbCancel := context.WithTimeout(context.Background(), time.Duration(g.cfg.Retry.TimeoutSeconds)*time.Second)
+	defer fbCancel()
+	altResp, aerr := g.doUpstream(fbCtx, altRoute, altEncoded, ids)
 	if aerr != nil {
 		// Both tiers are out: surface the original primary-tier error so the
 		// client gets the more meaningful rate-limit signal.

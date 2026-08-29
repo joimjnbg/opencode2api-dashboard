@@ -7,7 +7,9 @@
 ### 新增
 
 - **跨层自动回退（`failover.cross_tier_fallback_model`）**：主上游（zen 层，如只有每日限额的 Google AI Studio）全部 key 配额耗尽/冷却/节流时，自动把请求改写到第二上游（go 层）的指定模型继续服务——客户端无感、用量仍记在原模型名下；两层都不可用才返回 503。留空禁用。
-- **Gemini 请求字段清洗（消除 `upstream_error: Bad Request`）**：`sanitizeOpenAIBody` 现在还会剔除/改写 Gemini OpenAI 兼容端点拒绝的字段——`max_completion_tokens`→`max_tokens`（重命名，这是 opencode ai-sdk 发出的主要 400 来源）、`function_call`/`functions`/`metadata`/`reasoning_effort`/`service_tier` 直接剔除、`temperature` 钳到 `[0,2]`、顶层 `system` 折叠进 messages 的 system 角色。此前只有 key 池全冷却才会回退，单条请求字段错误会直接透传 400。
+- **Gemini 请求字段清洗（消除 `upstream_error: Bad Request`）**：`sanitizeOpenAIBody` 现在还会剔除/改写 Gemini OpenAI 兼容端点拒绝的字段——`max_completion_tokens`/`max_output_tokens`→`max_tokens`（重命名）、`function_call`/`functions`/`metadata`/`reasoning_effort`/`service_tier` 直接剔除、`temperature` 钳到 `[0,2]`、顶层 `system` 折叠进 messages 的 system 角色；并把 Gemini 原生 GenerateContent 参数也一并剔除（`top_k`、`stop_sequences`、`candidate_count`、`safety_settings`、`response_schema`、`generation_config` 等大小写变体）——这些正是 opencode 为 Gemini 模型发出的、却让 OpenAI 兼容端点返回 400 的元凶。
+
+- **跨层回退使用独立上下文**：当主层（zen）全部 key 冷却/节流、请求回退到第二上游（go/lfree）时，改为用独立超时上下文发起回退请求，避免主层背压等待耗尽了请求预算导致回退请求被 `context canceled` 而失败（此前表现为 `all upstream keys are temporarily unavailable` 503）。
 
 - **瞬时上游故障整池重试**：一轮 key 池全部失败且属瞬态错误（上游 502/503/504 或传输错误）时，自动等待 key 冷却到期后重试整池（受 `retry.max_attempts` 与请求超时双重约束），4xx 请求形状错误不重试。对单 key 层（无下一个 key 可切换）尤为关键——上游偶发超时不再直接透传给客户端。
 - **双上游池（openai 模式）**：新增 `models.static_go` 静态目录，第二上游（`upstream.go` + `go_keys`）与主上游（`upstream.zen` + `zen_keys` + `models.static`）同时服务：按模型名路由到所属层，两层各自维护独立的 key 池、静默 failover、账号级熔断、配额停用与 Prometheus 指标（`tier="zen"|"go"`）。一个上游限流时另一个继续承担流量；两层模型名不应重复，`prefer` 仅在同名模型时生效。

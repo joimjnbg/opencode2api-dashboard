@@ -95,6 +95,47 @@ func TestSanitizeOpenAIBodyStripsModernUnsupportedFields(t *testing.T) {
 	}
 }
 
+// TestSanitizeOpenAIBodyStripsGeminiNativeParams covers the Gemini-native
+// GenerateContent params that clients targeting Gemini sometimes send but the
+// OpenAI-compatible endpoint rejects with 400 "Bad Request".
+func TestSanitizeOpenAIBodyStripsGeminiNativeParams(t *testing.T) {
+	in := map[string]any{
+		"model":           "gemini-3.7-flash",
+		"messages":        []any{map[string]any{"role": "user", "content": "hi"}},
+		"max_tokens":      10,
+		"top_k":           20,
+		"stop_sequences":  []any{"STOP"},
+		"candidate_count": 2,
+		"safety_settings": []any{},
+	}
+	out := sanitizeOpenAIBody(in)
+	for _, k := range []string{"top_k", "stop_sequences", "candidate_count", "safety_settings"} {
+		if _, ok := out[k]; ok {
+			t.Errorf("%s must be stripped (Gemini OpenAI endpoint rejects it)", k)
+		}
+	}
+	if _, ok := out["max_tokens"]; !ok {
+		t.Error("legitimate max_tokens must be preserved")
+	}
+}
+
+// TestSanitizeOpenAIBodyRenamesMaxOutputTokens verifies Gemini's own output-cap
+// param is also rewritten to max_tokens.
+func TestSanitizeOpenAIBodyRenamesMaxOutputTokens(t *testing.T) {
+	in := map[string]any{
+		"model":             "gemini-3.7-flash",
+		"messages":          []any{map[string]any{"role": "user", "content": "hi"}},
+		"max_output_tokens": 8,
+	}
+	out := sanitizeOpenAIBody(in)
+	if _, ok := out["max_output_tokens"]; ok {
+		t.Error("max_output_tokens should be removed")
+	}
+	if f, ok := toFloat(out["max_tokens"]); !ok || f != 8 {
+		t.Errorf("expected max_tokens=8, got %v", out["max_tokens"])
+	}
+}
+
 // TestSanitizeOpenAIBodyRenamesMaxCompletionTokens verifies the modern OpenAI
 // output-cap param is rewritten to Gemini's "max_tokens".
 func TestSanitizeOpenAIBodyRenamesMaxCompletionTokens(t *testing.T) {
