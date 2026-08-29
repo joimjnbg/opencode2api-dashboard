@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -31,7 +32,16 @@ func main() {
 	if cfg.Logging.Level == "debug" {
 		level = slog.LevelDebug
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+	var out io.Writer = os.Stdout
+	if f := cfg.Logging.File; f != "" {
+		fh, ferr := os.OpenFile(f, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if ferr != nil {
+			slog.Error("cannot open log file, falling back to stdout", "error", ferr)
+		} else {
+			out = io.MultiWriter(os.Stdout, fh)
+		}
+	}
+	logger := slog.New(slog.NewTextHandler(out, &slog.HandlerOptions{Level: level}))
 	gateway, err := NewGateway(cfg, logger)
 	if err != nil {
 		logger.Error("failed to initialize gateway", "error", err)

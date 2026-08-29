@@ -179,10 +179,15 @@ type upstreamNode struct {
 }
 
 type nodePool struct {
-	nodes        []*upstreamNode
-	transports   *transportPool
-	next         atomic.Uint64
-	cooldown     time.Duration
+	nodes      []*upstreamNode
+	transports *transportPool
+	next       atomic.Uint64
+	cooldown   time.Duration
+	// maxCooldown caps the exponential backoff a single key can accumulate.
+	// Zero means no cap. The fallback (go) tier sets this to the base
+	// cooldown so a flaky relay cannot grow a key's cooldown past the
+	// fallback window and silently disable the last-resort upstream.
+	maxCooldown  time.Duration
 	bindingsMu   sync.Mutex
 	bindingCount []int
 	// Account-level throttle. Upstreams commonly rate-limit every key of the
@@ -789,6 +794,9 @@ func (p *nodePool) MarkFailure(node *upstreamNode, resp *http.Response, err erro
 	failures := node.failures.Add(1)
 	multiplier := time.Duration(1 << min(failures-1, 3))
 	delay := p.cooldown * multiplier
+	if p.maxCooldown > 0 && delay > p.maxCooldown {
+		delay = p.maxCooldown
+	}
 	if resp != nil {
 		if retryAfter := parseRetryAfter(resp.Header.Get("Retry-After")); retryAfter > delay {
 			delay = retryAfter

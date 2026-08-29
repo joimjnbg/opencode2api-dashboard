@@ -42,7 +42,8 @@
     "failure_cooldown_seconds": 15
   },
   "logging": {
-    "level": "info"
+    "level": "info",
+    "file": "opencode2api.log"
   },
   "stats": {
     "audit_file": "opencode2api.audit.jsonl"

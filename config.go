@@ -72,6 +72,9 @@ type ModelsConfig struct {
 
 type LoggingConfig struct {
 	Level string `json:"level"`
+	// File, when set, is an append-only log destination. Logs are also written
+	// to stdout. Leaving it empty logs to stdout only.
+	File string `json:"file"`
 }
 
 // StatsConfig controls usage statistics. AuditFile enables durable JSONL

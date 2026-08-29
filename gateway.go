@@ -84,6 +84,10 @@ func NewGateway(cfg Config, logger *slog.Logger) (*Gateway, error) {
 	if err != nil {
 		return nil, fmt.Errorf("go node pool: %w", err)
 	}
+	// The go tier is the last-resort fallback. Cap its per-key cooldown at the
+	// base so transient relay errors cannot grow a key's backoff past the
+	// fallback window and knock the safety net offline.
+	goNodes.maxCooldown = cooldown
 	gateway := &Gateway{
 		cfg:        cfg,
 		logger:     logger,
@@ -291,6 +295,7 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 		}
 		ids := deriveRequestIDs(r, payload)
 		stream := boolAt(payload, "stream")
+		g.logger.Debug("inference request", "request_id", ids.Request, "client_model", model, "tier", route.Tier, "protocol", route.Protocol, "external", external, "stream", stream)
 		requestCtx, cancel := context.WithTimeout(r.Context(), time.Duration(g.cfg.Retry.TimeoutSeconds)*time.Second)
 		defer cancel()
 		resp, err := g.doUpstreamWithFallback(requestCtx, route, external, payload, ids)
@@ -399,12 +404,29 @@ func (g *Gateway) doUpstreamWithFallback(ctx context.Context, route modelRoute, 
 	if err != nil {
 		return nil, err
 	}
-	resp, err := g.doUpstream(ctx, route, encoded, ids)
-	if err == nil || route.Tier != TierZen || g.cfg.Failover.CrossTierFallbackModel == "" || len(g.cfg.GoKeys) == 0 {
+
+	// When a cross-tier fallback exists, bound how long we wait on the primary
+	// tier (backpressure waits + cooldowns) before giving up and failing over,
+	// so the client isn't held for the full request timeout when the primary is
+	// down. The fallback request gets its own fresh, full-length context.
+	fallbackEligible := route.Tier == TierZen && g.cfg.Failover.CrossTierFallbackModel != "" && len(g.cfg.GoKeys) > 0
+	primaryCtx := ctx
+	primaryCancel := func() {}
+	if fallbackEligible {
+		cap := 10 * time.Second
+		if d := time.Duration(g.cfg.Retry.TimeoutSeconds) * time.Second / 2; d > 0 && d < cap {
+			cap = d
+		}
+		primaryCtx, primaryCancel = context.WithTimeout(ctx, cap)
+	}
+	resp, err := g.doUpstream(primaryCtx, route, encoded, ids)
+	primaryCancel()
+	if err == nil || !fallbackEligible {
 		return resp, err
 	}
 	var te *throttleError
-	if !(errors.As(err, &te) || errors.Is(err, errQuotaExhausted) || errors.Is(err, errAllCooling)) {
+	allowFallback := errors.As(err, &te) || errors.Is(err, errQuotaExhausted) || errors.Is(err, errAllCooling) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+	if !allowFallback {
 		return resp, err
 	}
 
@@ -427,6 +449,7 @@ func (g *Gateway) doUpstreamWithFallback(ctx context.Context, route modelRoute, 
 	defer fbCancel()
 	altResp, aerr := g.doUpstream(fbCtx, altRoute, altEncoded, ids)
 	if aerr != nil {
+		g.logger.Warn("cross-tier fallback also failed", "request_id", ids.Request, "to_model", fallbackModel, "fallback_error", aerr.Error(), "primary_error", err.Error())
 		// Both tiers are out: surface the original primary-tier error so the
 		// client gets the more meaningful rate-limit signal.
 		return resp, err
@@ -565,14 +588,22 @@ requestLoop:
 				// Restore the body so callers that receive this response
 				// (4xx passthrough, lastResponse fallback) can still read it.
 				resp.Body = io.NopCloser(bytes.NewReader(captured.body))
+				// The go tier is the last-resort fallback. A long quota-park,
+				// account-reject, or throttle window on its single key would
+				// knock the safety net offline for minutes, so it only ever
+				// takes the short per-failure cooldown and keeps retrying.
+				isFallback := route.Tier == TierGo
 				if isQuotaError(captured.status, captured.body, g.cfg.Failover, g.cfg.UpstreamMode) {
-					if g.cfg.Failover.MultiAccount && g.cfg.Failover.QuotaParkMinutes > 0 {
+					if !isFallback && g.cfg.Failover.MultiAccount && g.cfg.Failover.QuotaParkMinutes > 0 {
 						// Daily free-quota cap: park the account out of rotation
 						// for the quota window instead of the short cooldown, so
 						// it stops wasting the remaining accounts' retries.
 						park := time.Duration(g.cfg.Failover.QuotaParkMinutes) * time.Minute
 						nodes.MarkQuotaParked(node, park)
 						g.logger.Warn("upstream account quota exhausted, parking until quota window", "request_id", ids.Request, "tier", route.Tier, "status", captured.status, "park_minutes", g.cfg.Failover.QuotaParkMinutes, "proxy", redactURL(proxy.name))
+					} else if isFallback {
+						nodes.MarkFailure(node, resp, err)
+						g.logger.Warn("fallback upstream quota error, short cooldown only", "request_id", ids.Request, "tier", route.Tier, "status", captured.status, "proxy", redactURL(proxy.name))
 					} else {
 						nodes.MarkQuotaExceeded(node, quotaCooldown)
 						g.logger.Warn("upstream quota exceeded, silent failover", "request_id", ids.Request, "tier", route.Tier, "status", captured.status, "proxy", redactURL(proxy.name))
@@ -585,9 +616,14 @@ requestLoop:
 				// remaining keys carry the traffic, and try the next key
 				// silently. The last rejected response is kept as a fallback
 				// so the client still gets the real error when every key is
-				// rejected.
+				// rejected. The fallback tier uses a short cooldown instead so
+				// a transient relay 401/403 cannot disable it.
 				if captured.status == http.StatusUnauthorized || captured.status == http.StatusForbidden {
-					nodes.MarkAccountRejected(node, accountRejectCooldown)
+					if isFallback {
+						nodes.MarkFailure(node, resp, err)
+					} else {
+						nodes.MarkAccountRejected(node, accountRejectCooldown)
+					}
 					lastResponse = resp
 					g.logger.Warn("upstream rejected key, silent failover", "request_id", ids.Request, "tier", route.Tier, "status", captured.status, "proxy", redactURL(proxy.name))
 					continue
@@ -598,8 +634,16 @@ requestLoop:
 				// cannot help, so the pool enters a throttle window and the
 				// request is held (backpressure) until it elapses. In
 				// multi-account mode each key is its own account, so a 429
-				// throttles only that key and the others keep serving.
+				// throttles only that key and the others keep serving. For the
+				// fallback tier a 429 is a short cooldown: the single key must
+				// stay in rotation.
 				if captured.status == http.StatusTooManyRequests {
+					if isFallback {
+						nodes.MarkFailure(node, resp, err)
+						lastResponse = resp
+						g.logger.Debug("fallback upstream rate limited, short cooldown only", "request_id", ids.Request, "tier", route.Tier, "proxy", redactURL(proxy.name))
+						continue
+					}
 					if g.cfg.Failover.MultiAccount {
 						nodes.MarkFailure(node, resp, err)
 						nodes.MarkNodeThrottled(node, g.cfg.Failover.Throttle)
@@ -752,7 +796,13 @@ func (g *Gateway) syncProxyResult(ctx context.Context, proxy *proxyTransport, st
 		return false
 	}
 	if isProxyFailure(err) {
-		g.rebindFailedProxy(proxy)
+		// A direct (no-proxy) egress cannot itself be "unavailable": an upstream
+		// timeout/refusal is the upstream's condition, not the route's. Marking
+		// it unhealthy would disable every key bound to it — including the
+		// fallback tier — whenever one upstream is merely slow or down.
+		if proxy.name != "direct" {
+			g.rebindFailedProxy(proxy)
+		}
 		g.verifyProxyAfterError(ctx, proxy, status)
 		return true
 	}
@@ -837,6 +887,15 @@ func (g *Gateway) StartProxyHealthChecks(ctx context.Context) {
 }
 
 func (g *Gateway) applyProxyHealthResult(result proxyHealthResult, source string, upstreamStatus int) {
+	// A direct egress has no intermediary that can go "unavailable"; an upstream
+	// or probe outage must never disable the route (and with it the fallback
+	// tier). Only real proxies can be marked unhealthy.
+	if result.proxy != nil && result.proxy.name == "direct" {
+		if result.err == nil {
+			result.proxy.healthy.Store(true)
+		}
+		return
+	}
 	if result.err == nil {
 		if !result.wasHealthy {
 			g.restoreProxy(result.proxy)
