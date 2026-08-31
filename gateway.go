@@ -186,7 +186,7 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		earliest = goThrottle
 	}
 	if !earliest.IsZero() {
-		throttleIn = int(earliest.Sub(now).Seconds())
+		throttleIn = max(int(earliest.Sub(now).Seconds()), 0)
 	}
 
 	writeJSON(w, httpStatus, healthResponse{
@@ -227,10 +227,12 @@ func (g *Gateway) authenticate(next http.HandlerFunc) http.HandlerFunc {
 			candidates = append(candidates, strings.TrimSpace(auth[7:]))
 		}
 		valid := false
+	KeyLoop:
 		for _, key := range g.cfg.ServerKeys {
 			for _, candidate := range candidates {
 				if len(candidate) == len(key) && subtle.ConstantTimeCompare([]byte(candidate), []byte(key)) == 1 {
 					valid = true
+					break KeyLoop
 				}
 			}
 		}
@@ -353,7 +355,7 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			}
 			return
 		}
-		responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+		responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 		if err != nil {
 			writeAPIError(w, external, http.StatusBadGateway, "failed to read upstream response", "upstream_error", ids.Request)
 			return

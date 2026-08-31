@@ -80,9 +80,16 @@ func (u *usageExtractReader) Read(p []byte) (int, error) {
 			return 0, io.EOF
 		}
 		line := u.scanner.Text()
-		u.processLine(line)
-		u.pending = append(u.pending, line...)
-		u.pending = append(u.pending, '\n')
+		// SSE event separators are blank lines. Emit them verbatim so clients
+		// that rely on proper SSE framing (OpenAI SDK, EventSource, etc.)
+		// can parse the stream correctly.
+		if line == "" {
+			u.pending = append(u.pending, '\n')
+		} else {
+			u.processLine(line)
+			u.pending = append(u.pending, line...)
+			u.pending = append(u.pending, '\n')
+		}
 	}
 	if len(u.pending) > 0 {
 		n := copy(p, u.pending)
