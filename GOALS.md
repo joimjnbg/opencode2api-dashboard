@@ -4,6 +4,7 @@
 
 ## 完成 (Done)
 
+- **上游模型目录自动刷新**：`StartModelRefresh` 在 openai 模式下每个周期自动从上游 `/v1/models` 拉取最新列表更新路由目录；静态列表退化为兜底，上游不可达时保留上次目录。提交 `95266a1`。
 - **跨层自动回退（`failover.cross_tier_fallback_model`）**：主上游（zen/Google）全部 key 配额耗尽/冷却/节流时，自动改写模型到第二上游（go/lfree）的 `big-pickle` 继续服务。提交 `11a3d01`。
 - **消除 `upstream_error: Bad Request`**：`sanitizeOpenAIBody` 重命名/剔除 Gemini 拒绝的字段（`max_completion_tokens`→`max_tokens`、`top_k`/`stop_sequences`/`candidate_count`/`max_output_tokens` 等大小写变体、`function_call` 等），并折叠顶层 `system`。提交 `49532ed`、`7c19efa`。
 - **回退使用独立上下文**：主层背压不再 `context canceled` 掉回退请求。提交 `7c19efa`。
@@ -22,5 +23,5 @@
 
 ## 维护惯例 (Maintenance)
 
-- **模型目录**：lfree 的服务列表会变，静态目录 `models.static_go` 需按 `GET {go base}/v1/models` 结果同步；客户端 `~/.config/opencode/opencode.json` 的 provider models 同步更新。
+- **模型目录**：已实现自动刷新，无需手动同步 `models.static_go`。静态列表仅作兜底；如上游长期不可达，可手动更新静态列表后重启。
 - **skills 更新**：经 `npx skills@latest add mattpocock/skills` 安装（项目级 `.agents/skills`），用 `npx skills@latest update -p -y` 拉取最新。
