@@ -24,4 +24,5 @@
 ## 维护惯例 (Maintenance)
 
 - **模型目录**：已实现自动刷新，无需手动同步 `models.static_go`。静态列表仅作兜底；如上游长期不可达，可手动更新静态列表后重启。
+- **开发流程**：每个新功能必须 TDD（先写测试再实现），完成后 rebuild + restart `opencode2api.exe`。
 - **skills 更新**：经 `npx skills@latest add mattpocock/skills` 安装（项目级 `.agents/skills`），用 `npx skills@latest update -p -y` 拉取最新。
