@@ -945,25 +945,39 @@ func protocolPath(protocol Protocol, mode UpstreamMode) string {
 }
 
 func (g *Gateway) StartModelRefresh(ctx context.Context) {
+	seeded := false
 	refresh := func() {
-		if g.cfg.UpstreamMode.isOpenAI() && (len(g.cfg.Models.Static) > 0 || len(g.cfg.Models.StaticGo) > 0) {
-			// OpenAI-compatible upstreams may not expose an OpenAI-shaped
-			// /models endpoint, so the catalog is taken from the configured
-			// static lists: Static routes to the primary upstream (zen tier),
-			// StaticGo to the second upstream (go tier).
-			g.catalog.Replace(g.cfg.Models.Static, g.cfg.Models.StaticGo)
-			g.logger.Info("model catalog loaded from static list", "models", len(g.cfg.Models.Static)+len(g.cfg.Models.StaticGo))
-			return
+		// Seed the catalog from static lists on the first cycle (openai mode
+		// only). This ensures the gateway has a working catalog immediately at
+		// startup, before the first upstream fetch completes.
+		if !seeded && g.cfg.UpstreamMode.isOpenAI() {
+			if len(g.cfg.Models.Static) > 0 || len(g.cfg.Models.StaticGo) > 0 {
+				g.catalog.Replace(g.cfg.Models.Static, g.cfg.Models.StaticGo)
+				g.logger.Info("model catalog seeded from static list", "models", len(g.cfg.Models.Static)+len(g.cfg.Models.StaticGo))
+			}
+			seeded = true
 		}
+
+		// Fetch model lists from each upstream's /v1/models endpoint.
+		// If a tier's fetch fails (returns nil), the catalog retains its
+		// previous state — static seed or prior successful refresh.
 		var zen, goModels []string
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() { defer wg.Done(); zen = g.refreshTier(ctx, g.cfg.Upstream.Zen, g.zenNodes) }()
 		go func() { defer wg.Done(); goModels = g.refreshTier(ctx, g.cfg.Upstream.Go, g.goNodes) }()
 		wg.Wait()
+
+		if zen == nil && g.zenNodes.Len() > 0 {
+			g.logger.Warn("zen tier model refresh failed, keeping previous catalog", "upstream", g.cfg.Upstream.Zen)
+		}
+		if goModels == nil && g.goNodes.Len() > 0 {
+			g.logger.Warn("go tier model refresh failed, keeping previous catalog", "upstream", g.cfg.Upstream.Go)
+		}
 		if zen != nil || goModels != nil {
 			g.catalog.Replace(zen, goModels)
-			g.logger.Info("model catalog refreshed", "models", len(g.catalog.List()))
+			snap := g.catalog.Snapshot()
+			g.logger.Info("model catalog refreshed", "zen", snap.Zen, "go", snap.Go, "total", snap.Total)
 		}
 	}
 	go func() {
