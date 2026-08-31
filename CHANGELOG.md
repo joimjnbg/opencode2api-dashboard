@@ -24,6 +24,10 @@
 
 ### 修复
 
+- **回退上下文保留客户端取消**：跨层回退的独立超时现在从原始请求上下文派生（而非 `context.Background()`），客户端断开时回退请求也会及时终止，不再浪费资源。
+- **`Retry-After` 不再能绕过冷却上限**：`MarkFailure` 中 `maxCooldown` 上限现在在 `Retry-After` 之后应用，确保上游返回过大 `Retry-After`（或无限重试）时单 key 仍会在基准窗口内恢复——回退层尤为关键。
+- **`PruneOlderThan` 已接入定时器**：`usageStats` 现在每小时自动清理 48 小时前的小时级统计，防止长期运行的网关内存无限增长。
+- **删除死代码 `sanitizeRequestModel`**：该函数未被调用，模型清洗已由 `routeWithSanitize`/`sanitizeModel` 处理。
 - **直连代理不再因上游超时而被判不可用**：`direct`（无代理直出）出口本身没有可“宕机”的中间节点，`isProxyFailure` 原把上游超时/连接拒绝也视作代理故障，导致任一上游（如 Google）慢或宕机时把共享的 `direct` 代理整体标记 `unhealthy`，连带禁用回退层（go）所有 key——表现为即便 lfree 可达也持续 `all upstream keys are temporarily unavailable` 503。现在 `direct` 代理永远不会因上游/探活失败被判不可用，上游故障改由 key 冷却处理。
 - **回退层（go）key 不会被长冷却拖垮**：回退层是唯一兜底上游，其单 key 不再累加指数退避（封顶为基准冷却），也不再因上游 429/401/403 触发 30 分钟额度停用或 10 分钟账号拒绝——只做短冷却并持续重试，确保兜底始终在线；主层（zen）行为不变。
 - **回退主层等待上限**：主层（zen）在回退前最多等待 `min(retry.timeout_seconds/2, 10s)`，避免把整个请求超时耗在已宕主层上、客户端在回退前就断开；回退请求仍用独立完整超时上下文。

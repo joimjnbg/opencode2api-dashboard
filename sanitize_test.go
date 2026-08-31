@@ -38,18 +38,3 @@ func TestSanitizeModelDisabled(t *testing.T) {
 		t.Errorf("sanitize should be off: got %q", got)
 	}
 }
-
-func TestSanitizeRequestModel(t *testing.T) {
-	cfg := SanitizeConfig{Enabled: true, StripFreeSuffix: true}
-	payload := map[string]any{"model": "deepseek-v4-flash-free", "messages": []any{}}
-	if got := sanitizeRequestModel(payload, cfg); got != "deepseek-v4-flash" {
-		t.Errorf("request model not rewritten: got %q", got)
-	}
-	if payload["model"] != "deepseek-v4-flash" {
-		t.Errorf("payload not updated: %v", payload["model"])
-	}
-	// Empty model returns empty without touching payload.
-	if got := sanitizeRequestModel(map[string]any{}, cfg); got != "" {
-		t.Errorf("empty model: got %q", got)
-	}
-}

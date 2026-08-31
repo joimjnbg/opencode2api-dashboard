@@ -794,13 +794,16 @@ func (p *nodePool) MarkFailure(node *upstreamNode, resp *http.Response, err erro
 	failures := node.failures.Add(1)
 	multiplier := time.Duration(1 << min(failures-1, 3))
 	delay := p.cooldown * multiplier
-	if p.maxCooldown > 0 && delay > p.maxCooldown {
-		delay = p.maxCooldown
-	}
+	// Respect the upstream's Retry-After hint...
 	if resp != nil {
 		if retryAfter := parseRetryAfter(resp.Header.Get("Retry-After")); retryAfter > delay {
 			delay = retryAfter
 		}
+	}
+	// ...but always honour the pool-wide cooldown cap so a large Retry-After
+	// (or an upstream with no cap) cannot permanently disable a key.
+	if p.maxCooldown > 0 && delay > p.maxCooldown {
+		delay = p.maxCooldown
 	}
 	node.cooldownUntil.Store(time.Now().Add(delay).UnixNano())
 }

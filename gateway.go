@@ -107,6 +107,9 @@ func NewGateway(cfg Config, logger *slog.Logger) (*Gateway, error) {
 	if cfg.Stats.AuditFile != "" {
 		gateway.stats.SetAudit(newAuditWriter(cfg.Stats.AuditFile))
 	}
+	// Periodically prune old hourly stats to prevent unbounded memory growth
+	// in long-running gateways.
+	gateway.stats.StartPrune(context.Background(), 48*time.Hour, time.Hour)
 	return gateway, nil
 }
 
@@ -442,10 +445,10 @@ func (g *Gateway) doUpstreamWithFallback(ctx context.Context, route modelRoute, 
 	if merr != nil {
 		return resp, err
 	}
-	// Use a fresh context for the fallback so the primary tier's backpressure
-	// wait (which can consume most of the request budget) does not cancel the
-	// second-tier request with "context canceled".
-	fbCtx, fbCancel := context.WithTimeout(context.Background(), time.Duration(g.cfg.Retry.TimeoutSeconds)*time.Second)
+	// Use a fresh timeout derived from the original request context so that:
+	// (1) the primary tier's backpressure wait cannot cancel the fallback via
+	//     the old deadline, and (2) client disconnection still propagates.
+	fbCtx, fbCancel := context.WithTimeout(ctx, time.Duration(g.cfg.Retry.TimeoutSeconds)*time.Second)
 	defer fbCancel()
 	altResp, aerr := g.doUpstream(fbCtx, altRoute, altEncoded, ids)
 	if aerr != nil {

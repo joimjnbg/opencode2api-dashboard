@@ -31,19 +31,4 @@ func sanitizeModel(model string, cfg SanitizeConfig) string {
 	return model
 }
 
-// sanitizeRequestHeader cleans obvious free-tier markers from a request body
-// in place. It handles the top-level "model" field for chat/responses and the
-// Anthropic message shape.
-func sanitizeRequestModel(payload map[string]any, cfg SanitizeConfig) string {
-	model := stringAt(payload, "model")
-	if model == "" {
-		return ""
-	}
-	cleaned := sanitizeModel(model, cfg)
-	if cleaned != "" && cleaned != model {
-		payload["model"] = cleaned
-	}
-	return cleaned
-}
-
 var _ = strings.TrimSpace

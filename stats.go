@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"sync"
 	"time"
@@ -101,6 +102,23 @@ func (s *usageStats) PruneOlderThan(window time.Duration) {
 			delete(s.hours, key)
 		}
 	}
+}
+
+// StartPrune runs a background goroutine that periodically drops hourly
+// buckets older than the given window, preventing unbounded memory growth.
+func (s *usageStats) StartPrune(ctx context.Context, window time.Duration, interval time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.PruneOlderThan(window)
+			}
+		}
+	}()
 }
 
 // Snapshot returns a JSON-serializable view of the stats.
