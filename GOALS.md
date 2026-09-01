@@ -11,6 +11,7 @@
 - **直连代理不再因上游超时被判不可用（本轮根因）**：`direct` 出口不会被单个上游超时标记 `unhealthy` 而连带禁用回退层；修掉了 Google 慢/宕时 lfree 明明可达却持续 503 的问题。提交 `5364de3`。
 - **回退层（go/lfree）单 key 存活**：封顶指数退避、不再因上游 429/401/403 触发 30 分钟额度停用 / 10 分钟账号拒绝——只做短冷却持续重试。提交 `5364de3`。
 - **主层回退前等待上限**：`min(retry.timeout_seconds/2, 10s)`，避免客户端在回退前断开。提交 `5364de3`。
+- **生产级可观测性**：Prometheus 延迟直方图 + 重试计数；管理 API（刷新目录 / 查看 key 状态 / 覆写冷却 / 探测上游）；分层并发限流。提交 `d47cfcb`、`ef8d465`、`6a58368`。
 - **完整文件日志**：`logging.file` 追加写 + stdout；请求入口与回退失败日志便于自诊断。提交 `5364de3`。
 - **改进记录 issue**：https://github.com/joimjnbg/opencode2api-dashboard/issues/3
 

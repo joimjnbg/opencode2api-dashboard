@@ -7,6 +7,9 @@
 ### 新增
 
 - **上游模型目录自动刷新（`StartModelRefresh` openai 模式）**：`upstream_mode: "openai"` 下不再仅依赖 `models.static` / `models.static_go` 静态列表，而是每个刷新周期自动从两个上游的 `/v1/models` 端点拉取最新模型列表并更新路由目录；静态列表退化为兜底——上游不可达或返回空列表时保留上一次的目录，不会清空。无需手动编辑 config.json 或重启网关即可跟进上游模型变更（新增/下线）。
+- **Prometheus 延迟直方图**：`/metrics` 新增 `opencode2api_upstream_latency_seconds`（按 tier 和 tier+model 分桶）与 `opencode2api_retries_total` 指标，桶边界 [0.1, 0.25, 0.5, 1, 2.5, 5, 10, 25] 秒，提供 p50/p95/p99 可见性。
+- **管理 API（`/admin/*`）**：新增需 `admin_keys` 认证的管理端点——`POST /admin/refresh`（强制刷新目录）、`GET /admin/keys`（逐 key 状态）、`POST /admin/cooldown`（覆写冷却）、`GET /admin/probe`（上游可达性探测）；所有变更写入 INFO 日志。
+- **分层并发限流（load shedding）**：新增 `max_concurrent_zen` / `max_concurrent_go` 配置，超出时返回 429 + `Retry-After`，`/metrics` 输出 `opencode2api_requests_shedded_total` 计数。
 - **跨层自动回退（`failover.cross_tier_fallback_model`）**：主上游（zen 层，如只有每日限额的 Google AI Studio）全部 key 配额耗尽/冷却/节流时，自动把请求改写到第二上游（go 层）的指定模型继续服务——客户端无感、用量仍记在原模型名下；两层都不可用才返回 503。留空禁用。
 - **Gemini 请求字段清洗（消除 `upstream_error: Bad Request`）**：`sanitizeOpenAIBody` 现在还会剔除/改写 Gemini OpenAI 兼容端点拒绝的字段——`max_completion_tokens`/`max_output_tokens`→`max_tokens`（重命名）、`function_call`/`functions`/`metadata`/`reasoning_effort`/`service_tier` 直接剔除、`temperature` 钳到 `[0,2]`、顶层 `system` 折叠进 messages 的 system 角色；并把 Gemini 原生 GenerateContent 参数也一并剔除（`top_k`、`stop_sequences`、`candidate_count`、`safety_settings`、`response_schema`、`generation_config` 等大小写变体）——这些正是 opencode 为 Gemini 模型发出的、却让 OpenAI 兼容端点返回 400 的元凶。
 
