@@ -139,6 +139,21 @@ func (g *Gateway) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		}
 	}
 
+	// Shedded request counts by tier.
+	shedded, _ := snapshot["shedded_total"].(map[string]*int64)
+	if len(shedded) > 0 {
+		out.WriteString("# HELP opencode2api_requests_shedded_total Requests rejected by concurrency limiter\n")
+		out.WriteString("# TYPE opencode2api_requests_shedded_total counter\n")
+		shedKeys := make([]string, 0, len(shedded))
+		for k := range shedded {
+			shedKeys = append(shedKeys, k)
+		}
+		sort.Strings(shedKeys)
+		for _, tier := range shedKeys {
+			fmt.Fprintf(&out, "opencode2api_requests_shedded_total{tier=%q} %d\n", tier, *shedded[tier])
+		}
+	}
+
 	// Health facts.
 	proxyTotal, proxyHealthy := g.transports.healthCounts()
 	fmt.Fprintf(&out, "# HELP opencode2api_proxies_total Configured proxy transports\n")

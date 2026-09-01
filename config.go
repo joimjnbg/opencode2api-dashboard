@@ -10,24 +10,26 @@ import (
 )
 
 type Config struct {
-	Listen       string            `json:"listen"`
-	ServerKeys   []string          `json:"server_keys"`
-	AdminKeys    []string          `json:"admin_keys"`
-	ZenKeys      []string          `json:"zen_keys"`
-	GoKeys       []string          `json:"go_keys"`
-	Proxies      []string          `json:"proxies"`
-	Upstream     UpstreamConfig    `json:"upstream"`
-	UpstreamMode UpstreamMode      `json:"upstream_mode"`
-	Retry        RetryConfig       `json:"retry"`
-	Models       ModelsConfig      `json:"models"`
-	Performance  PerformanceConfig `json:"performance"`
-	Logging      LoggingConfig     `json:"logging"`
-	Stats        StatsConfig       `json:"stats"`
-	Prefer       Tier              `json:"prefer"`
-	Sanitize     SanitizeConfig    `json:"sanitize"`
-	Failover     FailoverConfig    `json:"failover"`
-	Fingerprint  FingerprintConfig `json:"fingerprint"`
-	RateLimit    RateLimitConfig   `json:"rate_limit"`
+	Listen           string            `json:"listen"`
+	ServerKeys       []string          `json:"server_keys"`
+	AdminKeys        []string          `json:"admin_keys"`
+	ZenKeys          []string          `json:"zen_keys"`
+	GoKeys           []string          `json:"go_keys"`
+	Proxies          []string          `json:"proxies"`
+	Upstream         UpstreamConfig    `json:"upstream"`
+	UpstreamMode     UpstreamMode      `json:"upstream_mode"`
+	Retry            RetryConfig       `json:"retry"`
+	Models           ModelsConfig      `json:"models"`
+	Performance      PerformanceConfig `json:"performance"`
+	Logging          LoggingConfig     `json:"logging"`
+	Stats            StatsConfig       `json:"stats"`
+	Prefer           Tier              `json:"prefer"`
+	Sanitize         SanitizeConfig    `json:"sanitize"`
+	Failover         FailoverConfig    `json:"failover"`
+	Fingerprint      FingerprintConfig `json:"fingerprint"`
+	RateLimit        RateLimitConfig   `json:"rate_limit"`
+	MaxConcurrentZen int               `json:"max_concurrent_zen"`
+	MaxConcurrentGo  int               `json:"max_concurrent_go"`
 }
 
 type UpstreamConfig struct {
@@ -257,6 +259,12 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if cfg.Failover.QuotaParkMinutes < 0 {
 		return Config{}, errors.New("failover.quota_park_minutes must not be negative")
+	}
+	if cfg.MaxConcurrentZen < 0 {
+		return Config{}, errors.New("max_concurrent_zen must not be negative")
+	}
+	if cfg.MaxConcurrentGo < 0 {
+		return Config{}, errors.New("max_concurrent_go must not be negative")
 	}
 	for model, protocol := range cfg.Models.Protocols {
 		if model == "" || !validProtocol(Protocol(protocol)) {

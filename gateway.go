@@ -32,6 +32,7 @@ type Gateway struct {
 	catalog     *modelCatalog
 	stats       *usageStats
 	fingerprint *fingerprintStore
+	shedder     *shedder
 }
 
 type healthResponse struct {
@@ -106,6 +107,9 @@ func NewGateway(cfg Config, logger *slog.Logger) (*Gateway, error) {
 	}
 	if cfg.Stats.AuditFile != "" {
 		gateway.stats.SetAudit(newAuditWriter(cfg.Stats.AuditFile))
+	}
+	if cfg.MaxConcurrentZen > 0 || cfg.MaxConcurrentGo > 0 {
+		gateway.shedder = newShedder(cfg.MaxConcurrentZen, cfg.MaxConcurrentGo)
 	}
 	// Periodically prune old hourly stats to prevent unbounded memory growth
 	// in long-running gateways.
@@ -482,7 +486,14 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 		resp, err := g.doUpstreamWithFallback(requestCtx, route, external, payload, ids)
 		if err != nil {
 			var te *throttleError
+			var se *shedError
 			switch {
+			case errors.As(err, &se):
+				g.logger.Warn("tier concurrency limit reached, returning 429", "request_id", ids.Request, "tier", route.Tier)
+				g.stats.Record(model, bridgeUsage{}, 0, false)
+				w.Header().Set("Retry-After", "1")
+				writeAPIError(w, external, http.StatusTooManyRequests, "tier concurrency limit reached", "rate_limit_exceeded", ids.Request)
+				return
 			case errors.As(err, &te):
 				g.logger.Warn("account rate limited, returning 503", "request_id", ids.Request, "tier", route.Tier, "retry_after", te.retryAfter)
 				g.stats.Record(model, bridgeUsage{}, 0, false)
@@ -639,6 +650,17 @@ func (g *Gateway) doUpstreamWithFallback(ctx context.Context, route modelRoute, 
 }
 
 func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte, ids requestIDs) (*http.Response, error) {
+	if g.shedder != nil {
+		if !g.shedder.tryAcquire(route.Tier) {
+			g.logger.Warn("tier concurrency limit reached, shedding request",
+				"tier", route.Tier,
+				"request_id", ids.Request,
+			)
+			g.stats.AddShedded(string(route.Tier), 1)
+			return nil, &shedError{tier: route.Tier}
+		}
+		defer g.shedder.release(route.Tier)
+	}
 	nodes := g.zenNodes
 	baseURL := g.cfg.Upstream.Zen
 	if route.Tier == TierGo {

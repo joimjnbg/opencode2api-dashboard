@@ -103,6 +103,9 @@ type usageStats struct {
 
 	// Retry counter per tier.
 	retriesTotal map[string]*int64 // keyed by tier
+
+	// Shedded request counter per tier.
+	sheddedTotal map[string]*int64 // keyed by tier
 }
 
 func newUsageStats() *usageStats {
@@ -113,6 +116,7 @@ func newUsageStats() *usageStats {
 		upstreamLatency:      map[string]*histogramRecord{},
 		upstreamLatencyModel: map[string]*histogramRecord{},
 		retriesTotal:         map[string]*int64{},
+		sheddedTotal:         map[string]*int64{},
 	}
 }
 
@@ -196,6 +200,19 @@ func (s *usageStats) AddRetries(tier string, delta int64) {
 	*p += delta
 }
 
+// AddShedded increments the shedded request counter for the given tier by delta.
+func (s *usageStats) AddShedded(tier string, delta int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.sheddedTotal[tier]
+	if !ok {
+		v := int64(0)
+		p = &v
+		s.sheddedTotal[tier] = p
+	}
+	*p += delta
+}
+
 func (s *usageStats) PruneOlderThan(window time.Duration) {
 	cutoff := time.Now().UTC().Add(-window)
 	s.mu.Lock()
@@ -257,6 +274,7 @@ func (s *usageStats) Snapshot() map[string]any {
 		"upstream_latency":       s.upstreamLatency,
 		"upstream_latency_model": s.upstreamLatencyModel,
 		"retries_total":          s.retriesTotal,
+		"shedded_total":          s.sheddedTotal,
 	}
 }
 
