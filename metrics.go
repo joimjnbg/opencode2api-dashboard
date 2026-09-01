@@ -78,6 +78,67 @@ func (g *Gateway) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		}
 	}
 
+	// Upstream latency histograms by tier.
+	latencyHists, _ := snapshot["upstream_latency"].(map[string]*histogramRecord)
+	if len(latencyHists) > 0 {
+		out.WriteString("# HELP opencode2api_upstream_latency_seconds Upstream request latency\n")
+		out.WriteString("# TYPE opencode2api_upstream_latency_seconds histogram\n")
+		// Sort tier keys for deterministic output.
+		tierKeys := make([]string, 0, len(latencyHists))
+		for k := range latencyHists {
+			tierKeys = append(tierKeys, k)
+		}
+		sort.Strings(tierKeys)
+		for _, tier := range tierKeys {
+			h := latencyHists[tier]
+			for i, le := range h.Buckets {
+				fmt.Fprintf(&out, "opencode2api_upstream_latency_seconds_bucket{tier=%q,le=%q} %d\n", tier, fmt.Sprintf("%g", le), h.Counts[i])
+			}
+			fmt.Fprintf(&out, "opencode2api_upstream_latency_seconds_bucket{tier=%q,le=%q} %d\n", tier, "+Inf", h.TotalCount())
+			fmt.Fprintf(&out, "opencode2api_upstream_latency_seconds_sum{tier=%q} %.6f\n", tier, h.Sum())
+			fmt.Fprintf(&out, "opencode2api_upstream_latency_seconds_count{tier=%q} %d\n", tier, h.TotalCount())
+		}
+	}
+
+	// Upstream latency histograms per tier:model.
+	latencyModelHists, _ := snapshot["upstream_latency_model"].(map[string]*histogramRecord)
+	if len(latencyModelHists) > 0 {
+		out.WriteString("# HELP opencode2api_upstream_latency_model_seconds Upstream request latency per tier:model\n")
+		out.WriteString("# TYPE opencode2api_upstream_latency_model_seconds histogram\n")
+		modelKeys := make([]string, 0, len(latencyModelHists))
+		for k := range latencyModelHists {
+			modelKeys = append(modelKeys, k)
+		}
+		sort.Strings(modelKeys)
+		for _, key := range modelKeys {
+			h := latencyModelHists[key]
+			// key is "tier:model"
+			parts := strings.SplitN(key, ":", 2)
+			tier, model := parts[0], parts[1]
+			for i, le := range h.Buckets {
+				fmt.Fprintf(&out, "opencode2api_upstream_latency_model_seconds_bucket{tier=%q,model=%q,le=%q} %d\n", tier, model, fmt.Sprintf("%g", le), h.Counts[i])
+			}
+			fmt.Fprintf(&out, "opencode2api_upstream_latency_model_seconds_bucket{tier=%q,model=%q,le=%q} %d\n", tier, model, "+Inf", h.TotalCount())
+			fmt.Fprintf(&out, "opencode2api_upstream_latency_model_seconds_sum{tier=%q,model=%q} %.6f\n", tier, model, h.Sum())
+			fmt.Fprintf(&out, "opencode2api_upstream_latency_model_seconds_count{tier=%q,model=%q} %d\n", tier, model, h.TotalCount())
+		}
+	}
+
+	// Retry counts by tier.
+	retries, _ := snapshot["retries_total"].(map[string]*int64)
+	if len(retries) > 0 {
+		out.WriteString("# HELP opencode2api_retries_total Total upstream retry attempts\n")
+		out.WriteString("# TYPE opencode2api_retries_total counter\n")
+		retryKeys := make([]string, 0, len(retries))
+		for k := range retries {
+			retryKeys = append(retryKeys, k)
+		}
+		sort.Strings(retryKeys)
+		for _, tier := range retryKeys {
+			fmt.Fprintf(&out, "opencode2api_retries_total{tier=%q} %d\n", tier, *retries[tier])
+		}
+	}
+
 	// Health facts.
 	proxyTotal, proxyHealthy := g.transports.healthCounts()
 	fmt.Fprintf(&out, "# HELP opencode2api_proxies_total Configured proxy transports\n")

@@ -7,6 +7,60 @@ import (
 	"time"
 )
 
+// defaultLatencyBuckets are the standard Prometheus histogram boundaries
+// for upstream request latency in seconds.
+var defaultLatencyBuckets = []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 25}
+
+// histogramRecord is a lightweight, lock-free-by-convention histogram that
+// mirrors Prometheus bucket semantics. Callers must hold the usageStats mutex.
+type histogramRecord struct {
+	Buckets  []float64
+	Counts   []int64
+	sum      float64
+	totalObs int64
+}
+
+func newHistogram(buckets []float64) *histogramRecord {
+	b := make([]float64, len(buckets))
+	copy(b, buckets)
+	return &histogramRecord{
+		Buckets: b,
+		Counts:  make([]int64, len(buckets)),
+	}
+}
+
+// observe records a single observation, incrementing every bucket whose
+// upper bound is ≥ the value, plus tracking the running sum.
+func (h *histogramRecord) observe(value float64) {
+	h.sum += value
+	h.totalObs++
+	for i, le := range h.Buckets {
+		if value <= le {
+			h.Counts[i]++
+		}
+	}
+}
+
+func (h *histogramRecord) TotalCount() int64 {
+	return h.totalObs
+}
+
+func (h *histogramRecord) Sum() float64 {
+	return h.sum
+}
+
+// BoundCount returns the count of observations ≤ le. If le matches a bucket
+// exactly it returns that bucket's cumulative count. If le is past all buckets
+// it returns total observations. If le is before all buckets it returns 0.
+func (h *histogramRecord) BoundCount(le float64) int64 {
+	for i, bound := range h.Buckets {
+		if le <= bound {
+			return h.Counts[i]
+		}
+	}
+	return h.totalObs
+}
+
 // metricRecord aggregates counters for one model or one hour bucket.
 type metricRecord struct {
 	Requests        int     `json:"requests"`
@@ -42,13 +96,23 @@ type usageStats struct {
 	hours   map[string]*metricRecord
 	started time.Time
 	audit   *auditWriter
+
+	// Prometheus-style histograms for upstream latency.
+	upstreamLatency      map[string]*histogramRecord // keyed by tier ("zen", "go")
+	upstreamLatencyModel map[string]*histogramRecord // keyed by "tier:model"
+
+	// Retry counter per tier.
+	retriesTotal map[string]*int64 // keyed by tier
 }
 
 func newUsageStats() *usageStats {
 	return &usageStats{
-		models:  map[string]*metricRecord{},
-		hours:   map[string]*metricRecord{},
-		started: time.Now(),
+		models:               map[string]*metricRecord{},
+		hours:                map[string]*metricRecord{},
+		started:              time.Now(),
+		upstreamLatency:      map[string]*histogramRecord{},
+		upstreamLatencyModel: map[string]*histogramRecord{},
+		retriesTotal:         map[string]*int64{},
 	}
 }
 
@@ -90,6 +154,46 @@ func (s *usageStats) Record(model string, usage bridgeUsage, cost float64, ok bo
 			"cost":  cost,
 		})
 	}
+}
+
+// ObserveUpstreamLatency records an upstream request latency observation
+// for the given tier.
+func (s *usageStats) ObserveUpstreamLatency(tier string, latencySec float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	h, ok := s.upstreamLatency[tier]
+	if !ok {
+		h = newHistogram(defaultLatencyBuckets)
+		s.upstreamLatency[tier] = h
+	}
+	h.observe(latencySec)
+}
+
+// ObserveUpstreamLatencyModel records an upstream request latency observation
+// for a specific tier:model combination.
+func (s *usageStats) ObserveUpstreamLatencyModel(tier, model string, latencySec float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := tier + ":" + model
+	h, ok := s.upstreamLatencyModel[key]
+	if !ok {
+		h = newHistogram(defaultLatencyBuckets)
+		s.upstreamLatencyModel[key] = h
+	}
+	h.observe(latencySec)
+}
+
+// AddRetries increments the retry counter for the given tier by delta.
+func (s *usageStats) AddRetries(tier string, delta int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.retriesTotal[tier]
+	if !ok {
+		v := int64(0)
+		p = &v
+		s.retriesTotal[tier] = p
+	}
+	*p += delta
 }
 
 func (s *usageStats) PruneOlderThan(window time.Duration) {
@@ -146,10 +250,13 @@ func (s *usageStats) Snapshot() map[string]any {
 	}
 
 	return map[string]any{
-		"uptime_seconds": int(time.Since(s.started).Seconds()),
-		"total":          total,
-		"models":         models,
-		"hours":          hours,
+		"uptime_seconds":         int(time.Since(s.started).Seconds()),
+		"total":                  total,
+		"models":                 models,
+		"hours":                  hours,
+		"upstream_latency":       s.upstreamLatency,
+		"upstream_latency_model": s.upstreamLatencyModel,
+		"retries_total":          s.retriesTotal,
 	}
 }
 

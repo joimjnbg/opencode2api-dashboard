@@ -570,7 +570,11 @@ requestLoop:
 				req.Header.Set("Authorization", "Bearer "+node.key)
 			}
 
+			start := time.Now()
 			resp, err := proxy.client.Do(req)
+			latency := time.Since(start).Seconds()
+			g.stats.ObserveUpstreamLatency(string(route.Tier), latency)
+			g.stats.ObserveUpstreamLatencyModel(string(route.Tier), route.ID, latency)
 			status := 0
 			if resp != nil {
 				status = resp.StatusCode
@@ -698,6 +702,7 @@ requestLoop:
 		// bounds total time.
 		attempt++
 		if attempt < maxAttempts && transientRetryable(lastResponse, lastErr) {
+			g.stats.AddRetries(string(route.Tier), 1)
 			g.logger.Debug("transient upstream failure, retrying pool pass", "request_id", ids.Request, "tier", route.Tier, "attempt", attempt, "max_attempts", maxAttempts)
 			continue requestLoop
 		}
