@@ -264,6 +264,14 @@ func (p *nodePool) RestoreProxy(recoveredProxy int) int {
 
 func (p *nodePool) Len() int { return len(p.nodes) }
 
+// NodeByIndex returns the node at the given index, or nil if out of range.
+func (p *nodePool) NodeByIndex(index int) *upstreamNode {
+	if p == nil || index < 0 || index >= len(p.nodes) {
+		return nil
+	}
+	return p.nodes[index]
+}
+
 // SetMultiAccount enables per-account throttle scope and fair rotation.
 func (p *nodePool) SetMultiAccount(enabled bool) {
 	p.multiAccount = enabled

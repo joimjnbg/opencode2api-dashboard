@@ -12,6 +12,7 @@ import (
 type Config struct {
 	Listen       string            `json:"listen"`
 	ServerKeys   []string          `json:"server_keys"`
+	AdminKeys    []string          `json:"admin_keys"`
 	ZenKeys      []string          `json:"zen_keys"`
 	GoKeys       []string          `json:"go_keys"`
 	Proxies      []string          `json:"proxies"`
@@ -203,6 +204,7 @@ func LoadConfig(path string) (Config, error) {
 		return Config{}, fmt.Errorf("parse %s: %w", path, err)
 	}
 	trimList(&cfg.ServerKeys)
+	trimList(&cfg.AdminKeys)
 	trimList(&cfg.ZenKeys)
 	trimList(&cfg.GoKeys)
 	trimList(&cfg.Proxies)

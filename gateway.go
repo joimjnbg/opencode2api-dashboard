@@ -122,6 +122,10 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/stats", g.authenticate(g.handleStats))
 	mux.HandleFunc("GET /metrics", g.handleMetrics)
 	mux.HandleFunc("GET /healthz", g.handleHealth)
+	mux.HandleFunc("POST /admin/refresh", g.adminAuth(g.handleAdminRefresh))
+	mux.HandleFunc("GET /admin/keys", g.adminAuth(g.handleAdminKeys))
+	mux.HandleFunc("POST /admin/cooldown", g.adminAuth(g.handleAdminCooldown))
+	mux.HandleFunc("GET /admin/probe", g.adminAuth(g.handleAdminProbe))
 	return recoveryMiddleware(g.logger, mux)
 }
 
@@ -248,6 +252,35 @@ func (g *Gateway) authenticate(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// adminAuth is like authenticate but checks admin_keys instead of server_keys.
+func (g *Gateway) adminAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if len(g.cfg.AdminKeys) == 0 {
+			writeAdminError(w, http.StatusForbidden, "admin API is not configured", "admin_not_configured")
+			return
+		}
+		candidates := []string{strings.TrimSpace(r.Header.Get("x-api-key"))}
+		if auth := r.Header.Get("Authorization"); strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+			candidates = append(candidates, strings.TrimSpace(auth[7:]))
+		}
+		valid := false
+	KeyLoop:
+		for _, key := range g.cfg.AdminKeys {
+			for _, candidate := range candidates {
+				if len(candidate) == len(key) && subtle.ConstantTimeCompare([]byte(candidate), []byte(key)) == 1 {
+					valid = true
+					break KeyLoop
+				}
+			}
+		}
+		if !valid {
+			writeAdminError(w, http.StatusUnauthorized, "invalid admin API key", "authentication_error")
+			return
+		}
+		next(w, r)
+	}
+}
+
 func (g *Gateway) handleModels(w http.ResponseWriter, _ *http.Request) {
 	now := time.Now().Unix()
 	models := g.catalog.List()
@@ -263,6 +296,149 @@ func (g *Gateway) handleModels(w http.ResponseWriter, _ *http.Request) {
 		data = append(data, map[string]any{"id": model, "object": "model", "created": now, "owned_by": ownedBy})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+}
+
+// --- Admin endpoints ---
+
+// handleAdminRefresh forces a synchronous refresh of the model catalog from
+// both upstreams and returns the resulting model counts.
+func (g *Gateway) handleAdminRefresh(w http.ResponseWriter, r *http.Request) {
+	g.logger.Info("admin: refreshing model catalog")
+	// Seed static models (openai mode) on first call if not yet seeded.
+	g.refreshTierCatalog(r.Context())
+	snap := g.catalog.Snapshot()
+	g.logger.Info("admin: model catalog refresh complete", "zen", snap.Zen, "go", snap.Go, "total", snap.Total)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"zen":   snap.Zen,
+		"go":    snap.Go,
+		"total": snap.Total,
+	})
+}
+
+// refreshTierCatalog runs a synchronous refresh of both tiers and updates the catalog.
+func (g *Gateway) refreshTierCatalog(ctx context.Context) {
+	var zen, goModels []string
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); zen = g.refreshTier(ctx, g.cfg.Upstream.Zen, g.zenNodes) }()
+	go func() { defer wg.Done(); goModels = g.refreshTier(ctx, g.cfg.Upstream.Go, g.goNodes) }()
+	wg.Wait()
+	if zen != nil || goModels != nil {
+		g.catalog.Replace(zen, goModels)
+	}
+}
+
+type adminKeyStatus struct {
+	Index         int    `json:"index"`
+	State         string `json:"state"`
+	CooldownUntil int64  `json:"cooldown_until"`
+	Proxy         string `json:"proxy"`
+}
+
+// handleAdminKeys returns per-key status for both tiers.
+func (g *Gateway) handleAdminKeys(w http.ResponseWriter, _ *http.Request) {
+	zenKeys := g.buildAdminKeyList(g.zenNodes)
+	goKeys := g.buildAdminKeyList(g.goNodes)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"zen": zenKeys,
+		"go":  goKeys,
+	})
+}
+
+func (g *Gateway) buildAdminKeyList(nodes *nodePool) []adminKeyStatus {
+	if nodes == nil || nodes.Len() == 0 {
+		return []adminKeyStatus{}
+	}
+	snap := nodes.StatusSnapshot()
+	out := make([]adminKeyStatus, 0, len(snap))
+	for _, ks := range snap {
+		status := adminKeyStatus{
+			Index:         ks.Index,
+			State:         ks.State,
+			CooldownUntil: ks.CooldownUntil,
+		}
+		node := nodes.NodeByIndex(ks.Index)
+		if proxy := nodes.Proxy(node); proxy != nil {
+			status.Proxy = proxy.name
+		}
+		out = append(out, status)
+	}
+	return out
+}
+
+type cooldownRequest struct {
+	Tier            string `json:"tier"`
+	Index           int    `json:"index"`
+	CooldownSeconds int    `json:"cooldown_seconds"`
+}
+
+// handleAdminCooldown overrides the cooldown on a specific key.
+func (g *Gateway) handleAdminCooldown(w http.ResponseWriter, r *http.Request) {
+	var req cooldownRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4<<10)).Decode(&req); err != nil {
+		writeAdminError(w, http.StatusBadRequest, "invalid JSON body", "invalid_request")
+		return
+	}
+	if req.Tier != "zen" && req.Tier != "go" {
+		writeAdminError(w, http.StatusBadRequest, "tier must be \"zen\" or \"go\"", "invalid_tier")
+		return
+	}
+	if req.CooldownSeconds < 0 {
+		writeAdminError(w, http.StatusBadRequest, "cooldown_seconds must not be negative", "invalid_cooldown")
+		return
+	}
+	nodes := g.zenNodes
+	if req.Tier == "go" {
+		nodes = g.goNodes
+	}
+	node := nodes.NodeByIndex(req.Index)
+	if node == nil {
+		writeAdminError(w, http.StatusBadRequest, fmt.Sprintf("index %d out of range for %s tier", req.Index, req.Tier), "index_out_of_range")
+		return
+	}
+	if req.CooldownSeconds == 0 {
+		node.cooldownUntil.Store(0)
+		g.logger.Info("admin: cleared cooldown", "tier", req.Tier, "index", req.Index)
+	} else {
+		d := time.Duration(req.CooldownSeconds) * time.Second
+		node.cooldownUntil.Store(time.Now().Add(d).UnixNano())
+		g.logger.Info("admin: set cooldown", "tier", req.Tier, "index", req.Index, "seconds", req.CooldownSeconds)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleAdminProbe probes each upstream by refreshing the model catalog and
+// returns status per tier.
+func (g *Gateway) handleAdminProbe(w http.ResponseWriter, r *http.Request) {
+	g.logger.Info("admin: probing upstreams")
+	g.refreshTierCatalog(r.Context())
+	snap := g.catalog.Snapshot()
+	zenStatus := "ok"
+	goStatus := "ok"
+	if snap.Zen == 0 && g.zenNodes.Len() > 0 {
+		zenStatus = "no_models"
+	}
+	if snap.Go == 0 && g.goNodes.Len() > 0 {
+		goStatus = "no_models"
+	}
+	if g.zenNodes.Len() == 0 {
+		zenStatus = "not_configured"
+	}
+	if g.goNodes.Len() == 0 {
+		goStatus = "not_configured"
+	}
+	g.logger.Info("admin: probe complete", "zen_status", zenStatus, "go_status", goStatus)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"zen": map[string]any{"status": zenStatus, "models": snap.Zen},
+		"go":  map[string]any{"status": goStatus, "models": snap.Go},
+	})
+}
+
+// writeAdminError writes a JSON error response with a code field for automation.
+func writeAdminError(w http.ResponseWriter, status int, message, code string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": message, "code": code})
 }
 
 func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
