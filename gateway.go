@@ -1099,9 +1099,9 @@ func (g *Gateway) applyProxyHealthResult(result proxyHealthResult, source string
 	// or probe outage must never disable the route (and with it the fallback
 	// tier). Only real proxies can be marked unhealthy.
 	if result.proxy != nil && result.proxy.name == "direct" {
-		if result.err == nil {
-			result.proxy.healthy.Store(true)
-		}
+		// Always restore direct to healthy — checkClaimedProxy may have set
+		// healthy=false before this function was called.
+		result.proxy.healthy.Store(true)
 		return
 	}
 	if result.err == nil {
