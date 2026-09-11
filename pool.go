@@ -118,6 +118,12 @@ func (p *transportPool) CheckHealth(ctx context.Context, target string, timeout 
 }
 
 // checkClaimedProxy performs a check after the caller has acquired checking.
+// A direct egress has no intermediary that can go "unavailable", so it is
+// never marked unhealthy here: an upstream timeout/refusal is the upstream's
+// condition, not the route's. Callers (e.g. verifyProxyAfterError) invoke this
+// unconditionally, so marking direct unhealthy would briefly exclude every key
+// bound to it — including the fallback tier — until applyProxyHealthResult
+// restores it.
 func (p *transportPool) checkClaimedProxy(ctx context.Context, proxy *proxyTransport, target string, timeout time.Duration) proxyHealthResult {
 	defer proxy.checking.Store(false)
 	checkCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -136,8 +142,13 @@ func (p *transportPool) checkClaimedProxy(ctx context.Context, proxy *proxyTrans
 	if err == nil {
 		result.wasHealthy = proxy.healthy.Swap(true)
 	} else if isProxyFailure(err) {
-		result.failed = true
-		result.wasHealthy = proxy.healthy.Swap(false)
+		if proxy.name == "direct" {
+			result.wasHealthy = true
+			result.failed = false
+		} else {
+			result.failed = true
+			result.wasHealthy = proxy.healthy.Swap(false)
+		}
 	}
 	return result
 }

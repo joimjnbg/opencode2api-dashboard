@@ -1,5 +1,7 @@
 package main
 
+import "strings"
+
 // geminiUnsupportedParams lists OpenAI chat-completion request fields that
 // Gemini's OpenAI-compatible endpoint (generativelanguage.googleapis.com/
 // v1beta/openai) rejects with an opaque 400 "Bad Request". These fall into two
@@ -48,6 +50,14 @@ var geminiUnsupportedParams = []string{
 func sanitizeOpenAIBody(payload map[string]any) map[string]any {
 	for _, key := range geminiUnsupportedParams {
 		delete(payload, key)
+	}
+
+	// NVIDIA NVCF (nv/* models relayed via lfree to grpc.nvcf.nvidia.com)
+	// rejects parallel_tool_calls with 400/hang; strip it scoped to nv/
+	// models only. Gemini accepts the field, so keep it untouched there.
+	if m, ok := payload["model"].(string); ok && len(m) >= 3 && strings.HasPrefix(strings.ToLower(m), "nv/") {
+		delete(payload, "parallel_tool_calls")
+		delete(payload, "paralleltoolcalls")
 	}
 
 	// Gemini names the output cap "max_tokens". Both the newer OpenAI param

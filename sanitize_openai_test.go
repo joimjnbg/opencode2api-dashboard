@@ -177,6 +177,45 @@ func TestSanitizeOpenAIBodyClampsTemperature(t *testing.T) {
 	}
 }
 
+// TestSanitizeOpenAIBodyStripsParallelToolCallsForNvidia verifies that
+// parallel_tool_calls is removed for nv/* models (NVIDIA NVCF rejects it
+// with 400/hang) while tools and tool_choice are preserved, and that Gemini
+// models keep the field (Gemini accepts it).
+func TestSanitizeOpenAIBodyStripsParallelToolCallsForNvidia(t *testing.T) {
+	tools := []any{map[string]any{"type": "function", "function": map[string]any{"name": "read"}}}
+	in := map[string]any{
+		"model":               "nv/kimi-k3",
+		"messages":            []any{map[string]any{"role": "user", "content": "hi"}},
+		"tools":               tools,
+		"tool_choice":         "auto",
+		"parallel_tool_calls": true,
+	}
+	out := sanitizeOpenAIBody(in)
+	if _, ok := out["parallel_tool_calls"]; ok {
+		t.Error("parallel_tool_calls must be stripped for nv/* models (NVCF rejects it)")
+	}
+	if _, ok := out["paralleltoolcalls"]; ok {
+		t.Error("paralleltoolcalls must be stripped for nv/* models (NVCF rejects it)")
+	}
+	if _, ok := out["tools"]; !ok {
+		t.Error("tools must be preserved for nv/* models")
+	}
+	if _, ok := out["tool_choice"]; !ok {
+		t.Error("tool_choice must be preserved for nv/* models")
+	}
+
+	// Control case: Gemini accepts parallel_tool_calls, so it must be kept.
+	in2 := map[string]any{
+		"model":               "gemini-3.7-flash",
+		"messages":            []any{map[string]any{"role": "user", "content": "hi"}},
+		"parallel_tool_calls": true,
+	}
+	out2 := sanitizeOpenAIBody(in2)
+	if _, ok := out2["parallel_tool_calls"]; !ok {
+		t.Error("parallel_tool_calls must be preserved for Gemini models")
+	}
+}
+
 // TestSanitizeOpenAIBodyFoldsSystemField verifies a top-level "system" field
 // is folded into the messages array as a system role instead of being rejected.
 func TestSanitizeOpenAIBodyFoldsSystemField(t *testing.T) {
